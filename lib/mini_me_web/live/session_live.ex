@@ -94,7 +94,7 @@ defmodule MiniMeWeb.SessionLive do
           add_message(socket, :system, "Starting Claude Code...")
 
         :ready ->
-          add_message(socket, :system, "Ready!")
+          socket
 
         :processing ->
           socket
@@ -115,13 +115,30 @@ defmodule MiniMeWeb.SessionLive do
     {:noreply, push_event(socket, "scroll_bottom", %{})}
   end
 
-  def handle_info({:tool_start, tool_name}, socket) do
+  def handle_info({:tool_use, tool}, socket) do
+    message = %{
+      id: System.unique_integer([:positive]),
+      type: :tool_call,
+      tool_use_id: tool.id,
+      name: tool.name,
+      input: format_tool_input(tool.name, tool.input),
+      output: nil,
+      is_error: false,
+      collapsed: true,
+      timestamp: DateTime.utc_now()
+    }
+
     socket =
       socket
-      |> assign(:current_tool, tool_name)
-      |> add_message(:tool, "Using: #{tool_name}")
+      |> assign(:current_tool, tool.name)
+      |> update(:messages, fn messages -> messages ++ [message] end)
 
-    {:noreply, socket}
+    {:noreply, push_event(socket, "scroll_bottom", %{})}
+  end
+
+  def handle_info({:tool_result, result}, socket) do
+    socket = update(socket, :messages, &apply_tool_result(&1, result))
+    {:noreply, push_event(socket, "scroll_bottom", %{})}
   end
 
   def handle_info({:agent_done}, socket) do
@@ -145,6 +162,9 @@ defmodule MiniMeWeb.SessionLive do
 
   @impl true
   def handle_event("send", %{"message" => message}, socket) when message != "" do
+    require Logger
+    Logger.debug("SessionLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}")
+
     socket =
       socket
       |> add_message(:user, message)
@@ -152,6 +172,8 @@ defmodule MiniMeWeb.SessionLive do
 
     if socket.assigns.session_pid do
       UserSession.send_message(socket.assigns.session_pid, message)
+    else
+      Logger.warning("SessionLive.send: No session_pid, message dropped!")
     end
 
     {:noreply, push_event(socket, "scroll_bottom", %{})}
@@ -169,6 +191,12 @@ defmodule MiniMeWeb.SessionLive do
 
   def handle_event("update_input", %{"message" => value}, socket) do
     {:noreply, assign(socket, :input, value)}
+  end
+
+  def handle_event("toggle_tool", %{"id" => id}, socket) do
+    id = String.to_integer(id)
+    socket = update(socket, :messages, &toggle_tool_message(&1, id))
+    {:noreply, socket}
   end
 
   @impl true
@@ -208,10 +236,45 @@ defmodule MiniMeWeb.SessionLive do
       
     <!-- Messages -->
       <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messages">
-        <div :for={msg <- @messages} class={message_class(msg.type)}>
-          <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
-          <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
-        </div>
+        <%= for msg <- @messages do %>
+          <%= if msg.type == :tool_call do %>
+            <div class="border border-gray-700 rounded-lg overflow-hidden">
+              <button
+                phx-click="toggle_tool"
+                phx-value-id={msg.id}
+                class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
+              >
+                <span class="text-gray-500 transition-transform duration-200" style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}>
+                  ▶
+                </span>
+                <span class="text-yellow-400 font-medium">{msg.name}</span>
+                <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
+                <%= if msg.is_error do %>
+                  <span class="text-red-400 text-xs">error</span>
+                <% end %>
+              </button>
+              <div class={"px-3 py-2 bg-gray-900 border-t border-gray-700 #{if msg.collapsed, do: "hidden", else: ""}"}>
+                <div class="text-xs text-gray-500 mb-1">Input</div>
+                <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">{msg.input}</div>
+                <%= if msg.output do %>
+                  <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
+                  <div class={"whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto #{if msg.is_error, do: "text-red-400", else: "text-gray-300"}"}>{msg.output}</div>
+                <% else %>
+                  <div class="text-xs text-gray-500 italic">Running...</div>
+                <% end %>
+              </div>
+            </div>
+          <% else %>
+            <div class={message_class(msg.type)}>
+              <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
+              <%= if msg.type == :assistant do %>
+                <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
+              <% else %>
+                <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
+              <% end %>
+            </div>
+          <% end %>
+        <% end %>
       </div>
       
     <!-- Input -->
@@ -241,6 +304,27 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   # Helper functions
+
+  defp toggle_tool_message(messages, id) do
+    Enum.map(messages, fn msg ->
+      if msg.id == id && msg.type == :tool_call, do: %{msg | collapsed: !msg.collapsed}, else: msg
+    end)
+  end
+
+  defp apply_tool_result(messages, result) do
+    Enum.map(messages, &update_tool_message(&1, result))
+  end
+
+  defp update_tool_message(%{type: :tool_call, tool_use_id: id} = msg, %{tool_use_id: id} = result) do
+    output = extract_tool_output(result)
+    %{msg | output: output, is_error: result.is_error}
+  end
+
+  defp update_tool_message(msg, _result), do: msg
+
+  defp extract_tool_output(%{stderr: stderr}) when stderr != "", do: stderr
+  defp extract_tool_output(%{stdout: stdout}) when stdout != "", do: stdout
+  defp extract_tool_output(_result), do: "(no output)"
 
   defp add_message(socket, type, content) do
     message = %{
@@ -291,4 +375,34 @@ defmodule MiniMeWeb.SessionLive do
   defp status_text(:disconnected), do: "Disconnected"
   defp status_text(:initializing), do: "Initializing..."
   defp status_text(status), do: to_string(status)
+
+  defp format_tool_input("Bash", %{"command" => cmd}), do: cmd
+  defp format_tool_input("Read", %{"file_path" => path}), do: path
+  defp format_tool_input("Write", %{"file_path" => path}), do: path
+  defp format_tool_input("Edit", %{"file_path" => path}), do: path
+  defp format_tool_input("Glob", %{"pattern" => pattern}), do: pattern
+  defp format_tool_input("Grep", %{"pattern" => pattern}), do: pattern
+  defp format_tool_input("WebFetch", %{"url" => url}), do: url
+  defp format_tool_input("WebSearch", %{"query" => query}), do: query
+  defp format_tool_input("Task", %{"prompt" => prompt}), do: String.slice(prompt, 0, 100)
+
+  defp format_tool_input(_name, input) when is_map(input) do
+    input
+    |> Map.take(["command", "file_path", "pattern", "query", "url", "prompt"])
+    |> Map.values()
+    |> List.first()
+    |> case do
+      nil -> inspect(input)
+      val -> val
+    end
+  end
+
+  defp format_tool_input(_name, input), do: inspect(input)
+
+  defp render_markdown(content) when is_binary(content) do
+    content
+    |> Earmark.as_html!(code_class_prefix: "language-")
+  end
+
+  defp render_markdown(_), do: ""
 end

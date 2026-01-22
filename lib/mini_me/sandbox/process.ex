@@ -169,15 +169,50 @@ defmodule MiniMe.Sandbox.Process do
     do: %{type: :system_init, data: event}
 
   defp normalize_event("assistant", %{"message" => %{"content" => content}}) do
-    text =
-      content
-      |> Enum.map_join("", fn
-        %{"type" => "text", "text" => t} -> t
-        %{"type" => "tool_use", "name" => name} -> "[Using tool: #{name}]"
-        _ -> ""
+    # Separate text content from tool uses
+    {text_parts, tool_uses} =
+      Enum.reduce(content, {[], []}, fn item, {texts, tools} ->
+        case item do
+          %{"type" => "text", "text" => t} ->
+            {[t | texts], tools}
+
+          %{"type" => "tool_use", "name" => name, "id" => id} = tool ->
+            input = Map.get(tool, "input", %{})
+            {texts, [%{id: id, name: name, input: input} | tools]}
+
+          _ ->
+            {texts, tools}
+        end
       end)
 
-    %{type: :assistant_message, text: text}
+    text = text_parts |> Enum.reverse() |> Enum.join("")
+    tool_uses = Enum.reverse(tool_uses)
+
+    %{type: :assistant_message, text: text, tool_uses: tool_uses}
+  end
+
+  defp normalize_event("user", %{"tool_use_result" => result, "message" => message}) do
+    # Extract tool_use_id from the message content
+    tool_use_id =
+      case message do
+        %{"content" => [%{"tool_use_id" => id} | _]} -> id
+        _ -> nil
+      end
+
+    Logger.debug("Tool result raw: #{inspect(result)}")
+
+    # Extract output from various possible formats
+    {output, stderr, is_error} = extract_tool_output(result)
+
+    Logger.debug("Extracted output: #{inspect(String.slice(output || "", 0, 100))}")
+
+    %{
+      type: :tool_result,
+      tool_use_id: tool_use_id,
+      stdout: output,
+      stderr: stderr,
+      is_error: is_error
+    }
   end
 
   defp normalize_event("result", event),
@@ -185,6 +220,55 @@ defmodule MiniMe.Sandbox.Process do
 
   defp normalize_event(type, event),
     do: %{type: String.to_atom(type), data: event}
+
+  # Extract output from tool results which can come in various formats
+  defp extract_tool_output(result) when is_binary(result) do
+    # String result - could be content or error, assume content
+    {result, "", false}
+  end
+
+  defp extract_tool_output(result) when is_map(result) do
+    is_error = Map.get(result, "isError", false)
+    stderr = Map.get(result, "stderr", "")
+
+    # Try various keys where content might be stored
+    # Read tool uses: %{"file" => %{"content" => "..."}, "type" => "text"}
+    # Bash tool uses: %{"stdout" => "...", "stderr" => "..."}
+    content =
+      get_in(result, ["file", "content"]) ||
+        Map.get(result, "content") ||
+        Map.get(result, "output") ||
+        Map.get(result, "stdout") ||
+        Map.get(result, "result") ||
+        Map.get(result, "text") ||
+        ""
+
+    # Handle content that might be an array of content blocks
+    content = normalize_content(content)
+
+    {content, stderr, is_error}
+  end
+
+  defp extract_tool_output(result) do
+    # Unknown format, convert to string
+    {inspect(result), "", true}
+  end
+
+  # Normalize content which might be a string or array of content blocks
+  defp normalize_content(content) when is_binary(content), do: content
+  defp normalize_content(content) when is_list(content) do
+    Enum.map_join(content, "", fn
+      %{"type" => "text", "text" => text} -> text
+      %{"text" => text} -> text
+      item when is_binary(item) -> item
+      item -> inspect(item)
+    end)
+  end
+  defp normalize_content(content) when is_map(content) do
+    Map.get(content, "text", inspect(content))
+  end
+  defp normalize_content(nil), do: ""
+  defp normalize_content(content), do: inspect(content)
 
   defp token do
     Application.get_env(:mini_me, :sprites_token) ||

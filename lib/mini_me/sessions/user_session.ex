@@ -86,7 +86,9 @@ defmodule MiniMe.Sessions.UserSession do
 
   @impl true
   def handle_cast({:send_message, text}, state) do
+    Logger.debug("UserSession.send_message: status=#{state.status}, process_pid=#{inspect(state.process_pid)}, queue_len=#{:queue.len(state.message_queue)}")
     state = handle_user_message(text, state)
+    Logger.debug("UserSession.send_message after handle: status=#{state.status}, process_pid=#{inspect(state.process_pid)}")
     {:noreply, state}
   end
 
@@ -173,7 +175,9 @@ defmodule MiniMe.Sessions.UserSession do
   def handle_info({:agent_exit, code}, state) do
     Logger.info("Claude Code exited with code #{code}")
     broadcast(state, {:agent_done})
-    {:noreply, %{state | status: :exited, process_pid: nil}}
+    # Don't nil process_pid - the WebSockex (Sandbox.Process) is still alive
+    # and will reconnect, restarting Claude Code
+    {:noreply, %{state | status: :exited}}
   end
 
   def handle_info(msg, state) do
@@ -292,6 +296,29 @@ defmodule MiniMe.Sessions.UserSession do
     end
   end
 
+  defp restart_claude_code(state) do
+    # Stop old process if still alive
+    if state.process_pid && Elixir.Process.alive?(state.process_pid) do
+      GenServer.stop(state.process_pid, :normal)
+    end
+
+    broadcast(state, {:session_status, :starting_claude})
+
+    case Process.start_link(
+           sprite_name: state.workspace.sprite_name,
+           session_pid: self(),
+           working_dir: state.workspace.working_dir
+         ) do
+      {:ok, pid} ->
+        %{state | process_pid: pid, status: :connecting}
+
+      {:error, reason} ->
+        Logger.error("Failed to restart Claude Code: #{inspect(reason)}")
+        broadcast(state, {:agent_error, "Failed to reconnect: #{inspect(reason)}"})
+        %{state | status: :error}
+    end
+  end
+
   defp handle_user_message(text, state) do
     case state.status do
       :ready ->
@@ -299,6 +326,12 @@ defmodule MiniMe.Sessions.UserSession do
 
       :processing ->
         queue_message(text, state)
+
+      status when status in [:disconnected, :exited] ->
+        # Queue message and restart Claude Code to wake the sprite
+        state = queue_message(text, state)
+        Logger.info("Session #{status}, restarting Claude Code for queued message")
+        restart_claude_code(state)
 
       _ ->
         queue_message(text, state)
@@ -343,9 +376,23 @@ defmodule MiniMe.Sessions.UserSession do
     state
   end
 
-  defp handle_agent_event(%{type: :assistant_message, text: text}, state) do
-    transformed = Pipeline.strip_ansi(text)
-    broadcast(state, {:agent_text, transformed})
+  defp handle_agent_event(%{type: :assistant_message, text: text, tool_uses: tool_uses}, state) do
+    # Broadcast text if any
+    if text != "" do
+      transformed = Pipeline.strip_ansi(text)
+      broadcast(state, {:agent_text, transformed})
+    end
+
+    # Broadcast tool uses
+    Enum.each(tool_uses, fn tool ->
+      broadcast(state, {:tool_use, tool})
+    end)
+
+    state
+  end
+
+  defp handle_agent_event(%{type: :tool_result} = result, state) do
+    broadcast(state, {:tool_result, result})
     state
   end
 

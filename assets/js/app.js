@@ -34,9 +34,6 @@ const Hooks = {
       this.scrollToBottom()
       this.handleEvent("scroll_bottom", () => this.scrollToBottom())
     },
-    updated() {
-      this.scrollToBottom()
-    },
     scrollToBottom() {
       const messages = this.el.querySelector("#messages")
       if (messages) {
