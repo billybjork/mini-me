@@ -114,14 +114,31 @@ defmodule MiniMe.Sandbox.Process do
   # Private Functions
 
   defp build_claude_command(working_dir, repo_name) do
-    oauth_token = Application.get_env(:mini_me, :claude_oauth_token)
+    # Get a valid OAuth token, automatically refreshing if expired.
+    # This calls the ClaudeTokenManager which handles the refresh flow with
+    # Anthropic's OAuth endpoint. See MiniMe.Auth.ClaudeTokenManager for details.
+    claude_token_prefix =
+      case MiniMe.Auth.ClaudeTokenManager.get_access_token() do
+        {:ok, token} ->
+          "CLAUDE_CODE_OAUTH_TOKEN=#{token} "
 
-    env_prefix =
-      if oauth_token do
-        "CLAUDE_CODE_OAUTH_TOKEN=#{oauth_token} "
-      else
-        ""
+        {:error, reason} ->
+          Logger.warning("Failed to get Claude OAuth token: #{inspect(reason)}")
+          # Fall back to legacy env var if token manager fails
+          case Application.get_env(:mini_me, :claude_oauth_token) do
+            nil -> ""
+            token -> "CLAUDE_CODE_OAUTH_TOKEN=#{token} "
+          end
       end
+
+    # Pass GitHub token to enable `gh` CLI operations (creating PRs, issues, etc.)
+    gh_token_prefix =
+      case Application.get_env(:mini_me, :github_token) do
+        nil -> ""
+        token -> "GH_TOKEN=#{token} "
+      end
+
+    env_prefix = claude_token_prefix <> gh_token_prefix
 
     # Provide context about the task's repository via system prompt
     context_prompt =
@@ -262,36 +279,148 @@ defmodule MiniMe.Sandbox.Process do
   end
 
   # Extract output from tool results which can come in various formats
+  # Returns {content, stderr, is_error}
+
+  # String result - direct content
   defp extract_tool_output(result) when is_binary(result) do
-    # String result - could be content or error, assume content
     {result, "", false}
   end
 
-  defp extract_tool_output(result) when is_map(result) do
-    is_error = Map.get(result, "isError", false)
+  # Bash tool: %{"stdout" => "...", "stderr" => "...", "interrupted" => bool}
+  defp extract_tool_output(%{"stdout" => stdout} = result) do
     stderr = Map.get(result, "stderr", "")
-
-    # Try various keys where content might be stored
-    # Read tool uses: %{"file" => %{"content" => "..."}, "type" => "text"}
-    # Bash tool uses: %{"stdout" => "...", "stderr" => "..."}
-    content =
-      get_in(result, ["file", "content"]) ||
-        Map.get(result, "content") ||
-        Map.get(result, "output") ||
-        Map.get(result, "stdout") ||
-        Map.get(result, "result") ||
-        Map.get(result, "text") ||
-        ""
-
-    # Handle content that might be an array of content blocks
-    content = normalize_content(content)
-
-    {content, stderr, is_error}
+    is_error = Map.get(result, "isError", false)
+    {stdout, stderr, is_error}
   end
 
+  # Read tool: %{"file" => %{"content" => "..."}, "type" => "text"}
+  defp extract_tool_output(%{"file" => %{"content" => content}}) do
+    {content, "", false}
+  end
+
+  # Task list updates: %{"newTodos" => [...], "oldTodos" => [...]}
+  defp extract_tool_output(%{"newTodos" => new_todos, "oldTodos" => old_todos}) do
+    {format_todo_changes(new_todos, old_todos), "", false}
+  end
+
+  # Glob: %{"files" => [...]} or similar list result
+  defp extract_tool_output(%{"files" => files}) when is_list(files) do
+    {format_file_list(files), "", false}
+  end
+
+  # Grep: %{"matches" => [...]} or content with matches
+  defp extract_tool_output(%{"matches" => matches}) when is_list(matches) do
+    {format_matches(matches), "", false}
+  end
+
+  # Generic map with common content keys
+  defp extract_tool_output(%{"content" => content} = result) do
+    is_error = Map.get(result, "isError", false)
+    {normalize_content(content), "", is_error}
+  end
+
+  defp extract_tool_output(%{"output" => output} = result) do
+    is_error = Map.get(result, "isError", false)
+    {normalize_content(output), "", is_error}
+  end
+
+  defp extract_tool_output(%{"result" => result_content} = result) do
+    is_error = Map.get(result, "isError", false)
+    {normalize_content(result_content), "", is_error}
+  end
+
+  defp extract_tool_output(%{"text" => text} = result) do
+    is_error = Map.get(result, "isError", false)
+    {text, "", is_error}
+  end
+
+  # Unknown map format - serialize for transparency
+  defp extract_tool_output(result) when is_map(result) do
+    is_error = Map.get(result, "isError", false)
+    {format_unknown_result(result), "", is_error}
+  end
+
+  # Fallback for any other type
   defp extract_tool_output(result) do
-    # Unknown format, convert to string
-    {inspect(result), "", true}
+    {inspect(result, pretty: true), "", false}
+  end
+
+  # Format helpers
+
+  defp format_todo_changes(new_todos, old_todos) do
+    old_map = Map.new(old_todos, fn t -> {t["content"], t["status"]} end)
+
+    changes =
+      Enum.reduce(new_todos, [], fn todo, acc ->
+        content = todo["content"]
+        new_status = todo["status"]
+        old_status = Map.get(old_map, content)
+
+        cond do
+          # New todo added
+          is_nil(old_status) ->
+            ["+ #{content}" | acc]
+
+          # Status changed
+          old_status != new_status ->
+            ["#{status_symbol(new_status)} #{content}" | acc]
+
+          # No change
+          true ->
+            acc
+        end
+      end)
+
+    case Enum.reverse(changes) do
+      [] -> "No changes"
+      changes -> Enum.join(changes, "\n")
+    end
+  end
+
+  defp status_symbol("completed"), do: "✓"
+  defp status_symbol("in_progress"), do: "→"
+  defp status_symbol("pending"), do: "○"
+  defp status_symbol(_), do: "•"
+
+  defp format_file_list([]), do: "No files found"
+
+  defp format_file_list(files) do
+    count = length(files)
+    preview = Enum.take(files, 10) |> Enum.join("\n")
+
+    if count > 10 do
+      "#{preview}\n... and #{count - 10} more files"
+    else
+      preview
+    end
+  end
+
+  defp format_matches([]), do: "No matches found"
+
+  defp format_matches(matches) do
+    count = length(matches)
+    preview = matches |> Enum.take(10) |> Enum.map_join("\n", &format_match/1)
+
+    if count > 10 do
+      "#{preview}\n... and #{count - 10} more matches"
+    else
+      preview
+    end
+  end
+
+  defp format_match(match) when is_binary(match), do: match
+  defp format_match(%{"file" => file, "line" => line}), do: "#{file}:#{line}"
+  defp format_match(%{"path" => path}), do: path
+  defp format_match(match), do: inspect(match)
+
+  defp format_unknown_result(result) do
+    # Remove common noise keys and format what's left
+    result
+    |> Map.drop(["isError", "type"])
+    |> case do
+      empty when map_size(empty) == 0 -> "OK"
+      cleaned -> Jason.encode!(cleaned, pretty: true)
+    end
   end
 
   # Normalize content which might be a string or array of content blocks

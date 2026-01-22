@@ -35,7 +35,7 @@ defmodule MiniMe.Repos do
   """
   def list_repos do
     Repo
-    |> order_by([r], [desc_nulls_last: r.last_used_at, desc: r.inserted_at])
+    |> order_by([r], desc_nulls_last: r.last_used_at, desc: r.inserted_at)
     |> DBRepo.all()
   end
 
@@ -78,6 +78,9 @@ defmodule MiniMe.Repos do
 
   @doc """
   Get working directory for a repo on a sprite.
+
+  Repos are cloned to /home/sprite/repos/{owner}/{repo} to keep them
+  organized and separate from other task artifacts.
   """
-  def working_dir(_repo), do: "/home/sprite/repo"
+  def working_dir(repo), do: "/home/sprite/repos/#{repo.github_name}"
 end

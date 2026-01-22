@@ -183,8 +183,8 @@ defmodule MiniMeWeb.HomeLive do
             <h1 class="text-3xl font-bold">Mini Me</h1>
             <.sprite_indicator status={@sprite_status} />
           </div>
-
-          <!-- New Task Button -->
+          
+    <!-- New Task Button -->
           <div class="mb-8">
             <button
               phx-click="new_task"
@@ -193,8 +193,8 @@ defmodule MiniMeWeb.HomeLive do
               + New Task
             </button>
           </div>
-
-          <!-- Recent Tasks -->
+          
+    <!-- Recent Tasks -->
           <div :if={map_size(@tasks_map) > 0} class="mb-8">
             <h2 class="text-xl font-semibold mb-4">Recent Tasks</h2>
             <div class="space-y-2" id="tasks" phx-update="stream">
@@ -238,8 +238,8 @@ defmodule MiniMeWeb.HomeLive do
               </div>
             </div>
           </div>
-
-          <!-- Repository Selector -->
+          
+    <!-- Repository Selector -->
           <div class="mb-8">
             <h2 class="text-xl font-semibold mb-4">Start Task with Repository</h2>
 

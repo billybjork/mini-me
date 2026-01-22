@@ -83,8 +83,7 @@ defmodule MiniMe.Sandbox.Allocator do
 
   @impl true
   def handle_call({:allocate, task}, _from, state) do
-    repo = task.repo
-    repo_id = repo && repo.id
+    repo_id = task.repo_id
 
     case check_and_acquire_lock(state, task.id, repo_id) do
       {:ok, state} ->
@@ -149,7 +148,7 @@ defmodule MiniMe.Sandbox.Allocator do
 
   # Private Functions
 
-  defp check_and_acquire_lock(state, task_id, nil) do
+  defp check_and_acquire_lock(state, _task_id, nil) do
     # No repo, no lock needed
     {:ok, state}
   end
@@ -185,10 +184,12 @@ defmodule MiniMe.Sandbox.Allocator do
 
   defp setup_sprite_for_task(task) do
     sprite_name = @default_sprite_name
+    # Only use repo if it's loaded (avoid NotLoaded struct)
+    repo = if task.repo_id && Ecto.assoc_loaded?(task.repo), do: task.repo, else: nil
 
     with {:ok, _sprite} <- ensure_sprite_exists(sprite_name),
          :ok <- configure_git_credentials(sprite_name),
-         {:ok, working_dir} <- ensure_repo_cloned(sprite_name, task.repo) do
+         {:ok, working_dir} <- ensure_repo_cloned(sprite_name, repo) do
       {:ok, sprite_name, working_dir}
     end
   end
@@ -205,25 +206,60 @@ defmodule MiniMe.Sandbox.Allocator do
   end
 
   defp configure_git_credentials(sprite_name) do
-    token = Application.get_env(:mini_me, :github_token)
+    case Application.get_env(:mini_me, :github_token) do
+      nil ->
+        Logger.warning("No GitHub token configured, git operations may fail")
+        :ok
 
-    if token do
-      # Configure git credential helper to use the token for GitHub
-      credential_cmd = """
-      git config --global credential.helper store && \
-      echo "https://oauth2:#{token}@github.com" > ~/.git-credentials && \
-      git config --global user.email "mini-me@example.com" && \
-      git config --global user.name "Mini Me"
-      """
+      token ->
+        if git_already_configured?(sprite_name) do
+          Logger.debug("Git credentials already configured on #{sprite_name}")
+          :ok
+        else
+          do_configure_git_credentials(sprite_name, token)
+        end
+    end
+  end
 
-      case Client.exec(sprite_name, credential_cmd, timeout: 30_000) do
-        {:ok, %{"exit_code" => 0}} -> :ok
-        {:ok, %{"exit_code" => _, "output" => output}} -> {:error, {:git_config_failed, output}}
-        {:error, reason} -> {:error, {:git_config_failed, reason}}
-      end
+  defp git_already_configured?(sprite_name) do
+    case Client.exec(sprite_name, "git config --global user.email", timeout: 10_000) do
+      {:ok, %{"exit_code" => 0, "output" => output}} when output != "" -> true
+      _ -> false
+    end
+  end
+
+  defp do_configure_git_credentials(sprite_name, token) do
+    credential_cmd = """
+    git config --global credential.helper store && \
+    echo "https://oauth2:#{token}@github.com" > ~/.git-credentials && \
+    git config --global user.email "mini-me@example.com" && \
+    git config --global user.name "Mini Me"
+    """
+
+    case Client.exec(sprite_name, credential_cmd, timeout: 30_000) do
+      {:ok, %{"exit_code" => 0}} ->
+        :ok
+
+      {:ok, %{"exit_code" => _, "output" => output}} ->
+        handle_git_config_error(sprite_name, output)
+
+      {:error, reason} ->
+        {:error, {:git_config_failed, reason}}
+    end
+  end
+
+  defp handle_git_config_error(sprite_name, output) do
+    # If the error is a lock conflict, another process is configuring git
+    # concurrently - wait briefly and check if config succeeded
+    if String.contains?(output, "could not lock config file") do
+      Logger.debug("Git config locked, waiting for concurrent configuration")
+      Process.sleep(500)
+
+      if git_already_configured?(sprite_name),
+        do: :ok,
+        else: {:error, {:git_config_failed, output}}
     else
-      Logger.warning("No GitHub token configured, git operations may fail")
-      :ok
+      {:error, {:git_config_failed, output}}
     end
   end
 
@@ -235,12 +271,21 @@ defmodule MiniMe.Sandbox.Allocator do
   defp ensure_repo_cloned(sprite_name, repo) do
     working_dir = Repos.working_dir(repo)
 
-    # Check if repo is already cloned
+    # Check if a repo is already cloned at the working directory
     case Client.exec(sprite_name, "test -d #{working_dir}/.git") do
       {:ok, %{"exit_code" => 0}} ->
-        # Already cloned, pull latest
-        Logger.info("Repo already cloned at #{working_dir}, pulling latest")
-        pull_repo(sprite_name, working_dir)
+        # A repo exists - verify it's the correct one by checking remote URL
+        case verify_repo_remote(sprite_name, working_dir, repo.github_url) do
+          :ok ->
+            Logger.info("Correct repo already cloned at #{working_dir}, pulling latest")
+            pull_repo(sprite_name, working_dir)
+
+          :mismatch ->
+            # Wrong repo cloned - need to re-clone the correct one
+            Logger.warning("Wrong repo at #{working_dir}, re-cloning #{repo.github_name}")
+
+            clone_repo(sprite_name, repo.github_url, working_dir)
+        end
 
       _ ->
         # Need to clone
@@ -249,10 +294,43 @@ defmodule MiniMe.Sandbox.Allocator do
     end
   end
 
+  defp verify_repo_remote(sprite_name, working_dir, expected_url) do
+    # Get the current remote URL and compare with expected
+    cmd = "cd #{working_dir} && git remote get-url origin"
+
+    case Client.exec(sprite_name, cmd, timeout: 10_000) do
+      {:ok, %{"exit_code" => 0, "output" => output}} ->
+        actual_url = String.trim(output)
+
+        # Normalize URLs for comparison (handle .git suffix and trailing slashes)
+        if normalize_git_url(actual_url) == normalize_git_url(expected_url) do
+          :ok
+        else
+          Logger.debug("Repo mismatch: expected #{expected_url}, got #{actual_url}")
+          :mismatch
+        end
+
+      _ ->
+        # Can't determine remote, treat as mismatch to be safe
+        :mismatch
+    end
+  end
+
+  defp normalize_git_url(url) do
+    url
+    |> String.trim()
+    |> String.trim_trailing("/")
+    |> String.trim_trailing(".git")
+    |> String.downcase()
+  end
+
   defp clone_repo(sprite_name, github_url, working_dir) do
     # Ensure parent directory exists
     parent_dir = Path.dirname(working_dir)
     Client.exec(sprite_name, "mkdir -p #{parent_dir}", timeout: 10_000)
+
+    # Remove existing directory if it exists (e.g., from interrupted clone)
+    Client.exec(sprite_name, "rm -rf #{working_dir}", timeout: 30_000)
 
     clone_cmd = "git clone #{github_url} #{working_dir}"
 

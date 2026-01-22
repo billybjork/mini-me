@@ -12,6 +12,9 @@ defmodule MiniMe.Application do
       MiniMe.Repo,
       {DNSCluster, query: Application.get_env(:mini_me, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: MiniMe.PubSub},
+      # OAuth token manager - handles automatic refresh of Claude access tokens.
+      # Must start after Repo (needs DB) but before anything that makes API calls.
+      MiniMe.Auth.ClaudeTokenManager,
       # Registry for session process lookup
       {Registry, keys: :unique, name: MiniMe.Sessions.Registry},
       # Sprite allocator for managing sandbox allocation

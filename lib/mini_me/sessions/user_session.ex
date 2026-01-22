@@ -124,27 +124,17 @@ defmodule MiniMe.Sessions.UserSession do
 
   @impl true
   def handle_info(:initialize, state) do
-    broadcast(state, {:session_status, :connecting})
+    # Reload task from DB to avoid stale struct issues (e.g., after supervisor restart)
+    case Tasks.get_task(state.task.id) do
+      nil ->
+        Logger.warning("Task #{state.task.id} no longer exists, stopping session")
+        {:stop, :normal, state}
 
-    # Use SpriteAllocator to get a sprite and ensure repo is cloned
-    case Allocator.allocate(state.task) do
-      {:ok, %{sprite_name: sprite_name, working_dir: working_dir}} ->
-        Logger.info("Allocated sprite #{sprite_name} for task #{state.task.id}")
-        Tasks.mark_active(state.task)
-
-        state = %{state | sprite_name: sprite_name, working_dir: working_dir}
-        broadcast(state, {:session_status, :starting_agent})
-        start_claude_code(state)
-
-      {:error, {:repo_locked, other_task_id}} ->
-        Logger.warning("Repo locked by task #{other_task_id}")
-        broadcast(state, {:agent_error, "Repository is in use by another task"})
-        {:noreply, %{state | status: :error}}
-
-      {:error, reason} ->
-        Logger.error("Failed to allocate sprite: #{inspect(reason)}")
-        broadcast(state, {:agent_error, "Failed to create sandbox"})
-        {:noreply, %{state | status: :error}}
+      task ->
+        # Preload repo if the task has one
+        task = if task.repo_id, do: MiniMe.Repo.preload(task, :repo), else: task
+        state = %{state | task: task}
+        do_initialize(state)
     end
   end
 
@@ -247,8 +237,13 @@ defmodule MiniMe.Sessions.UserSession do
     # Release the sprite allocation
     Allocator.release(state.task)
 
-    # Mark task as idle
-    Tasks.mark_idle(state.task)
+    # Mark task as idle (gracefully handle if task was deleted)
+    try do
+      Tasks.mark_idle(state.task)
+    rescue
+      Ecto.StaleEntryError ->
+        Logger.debug("Task #{state.task.id} already deleted, skipping status update")
+    end
 
     # Clean up the sprite process if running
     if state.process_pid && Elixir.Process.alive?(state.process_pid) do
@@ -260,8 +255,42 @@ defmodule MiniMe.Sessions.UserSession do
 
   # Private Functions
 
+  defp do_initialize(state) do
+    broadcast(state, {:session_status, :connecting})
+
+    # Use SpriteAllocator to get a sprite and ensure repo is cloned
+    case Allocator.allocate(state.task) do
+      {:ok, %{sprite_name: sprite_name, working_dir: working_dir}} ->
+        Logger.info("Allocated sprite #{sprite_name} for task #{state.task.id}")
+
+        try do
+          Tasks.mark_active(state.task)
+          state = %{state | sprite_name: sprite_name, working_dir: working_dir}
+          broadcast(state, {:session_status, :starting_agent})
+          start_claude_code(state)
+        rescue
+          Ecto.StaleEntryError ->
+            Logger.warning("Task #{state.task.id} was deleted during initialization")
+            {:stop, :normal, state}
+        end
+
+      {:error, {:repo_locked, other_task_id}} ->
+        Logger.warning("Repo locked by task #{other_task_id}")
+        broadcast(state, {:agent_error, "Repository is in use by another task"})
+        {:noreply, %{state | status: :error}}
+
+      {:error, reason} ->
+        Logger.error("Failed to allocate sprite: #{inspect(reason)}")
+        broadcast(state, {:agent_error, "Failed to create sandbox"})
+        {:noreply, %{state | status: :error}}
+    end
+  end
+
   defp start_claude_code(state) do
-    repo_name = state.task.repo && state.task.repo.github_name
+    repo_name =
+      if state.task.repo_id && Ecto.assoc_loaded?(state.task.repo),
+        do: state.task.repo.github_name,
+        else: nil
 
     Logger.info("Starting Claude Code for task #{state.task.id} on sprite #{state.sprite_name}")
 
@@ -289,7 +318,10 @@ defmodule MiniMe.Sessions.UserSession do
 
     broadcast(state, {:session_status, :starting_agent})
 
-    repo_name = state.task.repo && state.task.repo.github_name
+    repo_name =
+      if state.task.repo_id && Ecto.assoc_loaded?(state.task.repo),
+        do: state.task.repo.github_name,
+        else: nil
 
     case Process.start_link(
            sprite_name: state.sprite_name,

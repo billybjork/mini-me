@@ -26,10 +26,19 @@ defmodule MiniMe.Chat.ExecutionSession do
 
   def changeset(session, attrs) do
     session
-    |> cast(attrs, [:task_id, :session_type, :status, :sprite_name, :started_at, :ended_at, :metadata])
+    |> cast(attrs, [
+      :task_id,
+      :session_type,
+      :status,
+      :sprite_name,
+      :started_at,
+      :ended_at,
+      :metadata
+    ])
     |> validate_required([:task_id, :session_type, :status, :started_at])
     |> validate_inclusion(:status, @statuses)
-    |> foreign_key_constraint(:task_id)
+    # Constraint was originally named for workspace_id before rename migration
+    |> foreign_key_constraint(:task_id, name: :execution_sessions_workspace_id_fkey)
   end
 
   def start_changeset(task_id, sprite_name, session_type \\ "claude_code") do

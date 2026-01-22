@@ -158,6 +158,8 @@ defmodule MiniMeWeb.TaskLive do
     socket =
       socket
       |> assign(:current_tool, tool.name)
+      |> assign(:streaming_message_id, nil)
+      |> assign(:streaming_message, nil)
       |> stream_insert(:messages, message)
       |> update(:messages_map, &Map.put(&1, message.id, message))
 
@@ -365,16 +367,22 @@ defmodule MiniMeWeb.TaskLive do
                     <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">
                       {msg.input}
                     </div>
-                    <div :if={msg.output}>
-                      <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
-                      <div class={[
-                        "whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto",
-                        if(msg.is_error, do: "text-red-400", else: "text-gray-300")
-                      ]}>
-                        {msg.output}
-                      </div>
-                    </div>
-                    <div :if={!msg.output} class="text-xs text-gray-500 italic">Running...</div>
+                    <%= cond do %>
+                      <% is_nil(msg.output) -> %>
+                        <div class="text-xs text-gray-500 italic">Running...</div>
+                      <% msg.output == "" -> %>
+                        <div class="text-xs text-gray-500 italic mt-2">Completed</div>
+                      <% true -> %>
+                        <div>
+                          <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
+                          <div class={[
+                            "whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto",
+                            if(msg.is_error, do: "text-red-400", else: "text-gray-300")
+                          ]}>
+                            {msg.output}
+                          </div>
+                        </div>
+                    <% end %>
                   </div>
                 </div>
               <% :assistant -> %>
@@ -420,9 +428,12 @@ defmodule MiniMeWeb.TaskLive do
 
   # Helper functions
 
-  defp extract_tool_output(%{stderr: stderr}) when stderr != "", do: stderr
-  defp extract_tool_output(%{stdout: stdout}) when stdout != "", do: stdout
-  defp extract_tool_output(_result), do: "(no output)"
+  # Prioritize stderr for errors, otherwise use stdout
+  # Returns the output string, or empty string if no meaningful output
+  defp extract_tool_output(%{stderr: stderr, is_error: true}) when stderr != "", do: stderr
+  defp extract_tool_output(%{stdout: stdout}) when is_binary(stdout), do: stdout
+  defp extract_tool_output(%{stderr: stderr}) when is_binary(stderr) and stderr != "", do: stderr
+  defp extract_tool_output(_result), do: ""
 
   defp add_message(socket, type, content) do
     task_id = socket.assigns.task.id
@@ -480,8 +491,8 @@ defmodule MiniMeWeb.TaskLive do
   defp message_class(:user), do: "p-3 bg-blue-900 rounded-lg ml-8"
   defp message_class(:assistant), do: "p-3 bg-gray-800 rounded-lg mr-8"
   defp message_class(:system), do: "p-2 text-gray-400 text-center text-sm"
-  defp message_class(:tool), do: "p-2 text-yellow-400 text-sm"
   defp message_class(:error), do: "p-3 bg-red-900 rounded-lg"
+  defp message_class(_), do: "p-2 text-gray-400 text-sm"
 
   defp status_color(:ready), do: "text-green-400"
   defp status_color(:processing), do: "text-yellow-400"

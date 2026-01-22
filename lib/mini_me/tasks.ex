@@ -110,8 +110,15 @@ defmodule MiniMe.Tasks do
 
   @doc """
   Delete a task. Returns :ok even if already deleted (idempotent).
+  Stops any running session and releases sprite allocation.
   """
   def delete_task(task) do
+    # Stop the UserSession if running (this will call Allocator.release via terminate/2)
+    case MiniMe.Sessions.Registry.lookup(task.id) do
+      {:ok, pid} -> GenServer.stop(pid, :normal)
+      :error -> MiniMe.Sandbox.Allocator.release(task)
+    end
+
     case Repo.delete(task, allow_stale: true) do
       {:ok, _} -> :ok
       {:error, _} -> :ok
