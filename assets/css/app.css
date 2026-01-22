@@ -102,6 +102,31 @@
 /* Make LiveView wrapper divs transparent for layout */
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
+/* Mobile utilities */
+.safe-top { padding-top: env(safe-area-inset-top, 0px); }
+.safe-bottom { padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); }
+
+.touch-target { min-height: 44px; min-width: 44px; }
+
+.tap-highlight {
+  -webkit-tap-highlight-color: transparent;
+}
+.tap-highlight:active {
+  opacity: 0.85;
+  transform: scale(0.98);
+}
+
+/* Prevent iOS zoom on input focus (must be 16px+) */
+input, select, textarea {
+  font-size: max(16px, 1rem);
+}
+
+/* Smooth mobile scrolling */
+.scroll-smooth-mobile {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
 /* This file is for your main application CSS */
 
 /* Markdown styles for chat messages */
@@ -184,4 +209,43 @@
   margin-left: 0;
   margin-bottom: 0.75rem;
   color: #9ca3af;
+}
+
+/* Typing indicator animation */
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+}
+
+.typing-indicator span {
+  width: 8px;
+  height: 8px;
+  background-color: #6b7280;
+  border-radius: 50%;
+  animation: typing-bounce 1.4s ease-in-out infinite;
+}
+
+.typing-indicator span:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.typing-indicator span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-indicator span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typing-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
 }

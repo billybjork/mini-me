@@ -33,6 +33,7 @@ defmodule MiniMeWeb.TaskLive do
       |> assign(:execution_session_id, nil)
       |> assign(:streaming_message_id, nil)
       |> assign(:streaming_message, nil)
+      |> assign(:pending_messages, [])
 
     if connected?(socket) do
       # Subscribe to session events
@@ -112,7 +113,8 @@ defmodule MiniMeWeb.TaskLive do
           add_message(socket, :system, "Starting agent...")
 
         :ready ->
-          socket
+          # Flush any pending messages that were queued while loading
+          flush_pending_messages(socket)
 
         :processing ->
           socket
@@ -233,22 +235,21 @@ defmodule MiniMeWeb.TaskLive do
 
   @impl true
   def handle_event("send", %{"message" => message}, socket) when message != "" do
-    require Logger
-
-    Logger.debug(
-      "TaskLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
-    )
-
+    # Always show the message in UI immediately
     socket =
       socket
       |> add_message(:user, message)
       |> assign(:input, "")
 
-    if socket.assigns.session_pid do
-      UserSession.send_message(socket.assigns.session_pid, message)
-    else
-      Logger.warning("TaskLive.send: No session_pid, message dropped!")
-    end
+    # Send now if ready, otherwise queue for later
+    socket =
+      if socket.assigns.status in [:ready, :processing] and socket.assigns.session_pid do
+        UserSession.send_message(socket.assigns.session_pid, message)
+        socket
+      else
+        # Queue the message to be sent when session is ready
+        update(socket, :pending_messages, &(&1 ++ [message]))
+      end
 
     {:noreply, push_event(socket, "scroll_bottom", %{})}
   end
@@ -296,7 +297,7 @@ defmodule MiniMeWeb.TaskLive do
         phx-hook="ScrollBottom"
       >
         <!-- Header -->
-        <header class="flex-none p-4 border-b border-gray-700">
+        <header class="flex-none p-4 border-b border-gray-700 safe-top">
           <div class="flex items-center justify-between">
             <div>
               <h1 class="text-lg font-semibold">{task_display_name(@task)}</h1>
@@ -311,11 +312,14 @@ defmodule MiniMeWeb.TaskLive do
               <button
                 :if={@status == :processing}
                 phx-click="interrupt"
-                class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm"
+                class="px-4 py-2.5 touch-target tap-highlight bg-red-600 hover:bg-red-700 rounded text-sm"
               >
                 Interrupt
               </button>
-              <.link navigate={~p"/"} class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+              <.link
+                navigate={~p"/"}
+                class="px-4 py-2.5 touch-target tap-highlight bg-gray-700 hover:bg-gray-600 rounded text-sm"
+              >
                 Back
               </.link>
             </div>
@@ -323,99 +327,114 @@ defmodule MiniMeWeb.TaskLive do
         </header>
         
     <!-- Messages -->
-        <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messages" phx-update="stream">
-          <div :for={{dom_id, msg} <- @streams.messages} id={dom_id}>
-            <%= case msg.type do %>
-              <% :session_start -> %>
-                <div class="flex items-center gap-3 py-2">
-                  <div class="flex-1 h-px bg-green-700"></div>
-                  <span class="text-xs text-green-500 font-medium px-2">
-                    Session Started
-                  </span>
-                  <div class="flex-1 h-px bg-green-700"></div>
-                </div>
-              <% :session_end -> %>
-                <div class="flex items-center gap-3 py-2">
-                  <div class="flex-1 h-px bg-gray-600"></div>
-                  <span class={"text-xs font-medium px-2 #{session_end_color(msg.content)}"}>
-                    Session {session_end_text(msg.content)}
-                  </span>
-                  <div class="flex-1 h-px bg-gray-600"></div>
-                </div>
-              <% :tool_call -> %>
-                <div class="border border-gray-700 rounded-lg overflow-hidden">
-                  <button
-                    phx-click="toggle_tool"
-                    phx-value-id={msg.id}
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
-                  >
-                    <span
-                      class="text-gray-500 transition-transform duration-200"
-                      style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}
-                    >
-                      ▶
+        <div class="flex-1 overflow-y-auto scroll-smooth-mobile p-4 space-y-4" id="messages-container">
+          <div id="messages" phx-update="stream">
+            <div :for={{dom_id, msg} <- @streams.messages} id={dom_id} class="mb-4">
+              <%= case msg.type do %>
+                <% :session_start -> %>
+                  <div class="flex items-center gap-3 py-2">
+                    <div class="flex-1 h-px bg-green-700"></div>
+                    <span class="text-xs text-green-500 font-medium px-2">
+                      Session Started
                     </span>
-                    <span class="text-yellow-400 font-medium">{msg.name}</span>
-                    <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
-                    <span :if={msg.is_error} class="text-red-400 text-xs">error</span>
-                  </button>
-                  <div class={[
-                    "px-3 py-2 bg-gray-900 border-t border-gray-700",
-                    msg.collapsed && "hidden"
-                  ]}>
-                    <div class="text-xs text-gray-500 mb-1">Input</div>
-                    <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">
-                      {msg.input}
-                    </div>
-                    <%= cond do %>
-                      <% is_nil(msg.output) -> %>
-                        <div class="text-xs text-gray-500 italic">Running...</div>
-                      <% msg.output == "" -> %>
-                        <div class="text-xs text-gray-500 italic mt-2">Completed</div>
-                      <% true -> %>
-                        <div>
-                          <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
-                          <div class={[
-                            "whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto",
-                            if(msg.is_error, do: "text-red-400", else: "text-gray-300")
-                          ]}>
-                            {msg.output}
-                          </div>
-                        </div>
-                    <% end %>
+                    <div class="flex-1 h-px bg-green-700"></div>
                   </div>
-                </div>
-              <% :assistant -> %>
-                <div class={message_class(:assistant)}>
-                  <div class="text-xs text-gray-500 mb-1">assistant</div>
-                  <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
-                </div>
-              <% _ -> %>
-                <div class={message_class(msg.type)}>
-                  <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
-                  <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
-                </div>
-            <% end %>
+                <% :session_end -> %>
+                  <div class="flex items-center gap-3 py-2">
+                    <div class="flex-1 h-px bg-gray-600"></div>
+                    <span class={"text-xs font-medium px-2 #{session_end_color(msg.content)}"}>
+                      Session {session_end_text(msg.content)}
+                    </span>
+                    <div class="flex-1 h-px bg-gray-600"></div>
+                  </div>
+                <% :tool_call -> %>
+                  <div class="border border-gray-700 rounded-lg overflow-hidden">
+                    <button
+                      phx-click="toggle_tool"
+                      phx-value-id={msg.id}
+                      class="w-full flex items-center gap-2 px-4 py-3 touch-target tap-highlight bg-gray-800 hover:bg-gray-750 text-left text-sm"
+                    >
+                      <span
+                        class="text-gray-500 transition-transform duration-200"
+                        style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}
+                      >
+                        ▶
+                      </span>
+                      <span class="text-yellow-400 font-medium">{msg.name}</span>
+                      <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
+                      <span :if={msg.is_error} class="text-red-400 text-xs">error</span>
+                    </button>
+                    <div class={[
+                      "px-3 py-2 bg-gray-900 border-t border-gray-700",
+                      msg.collapsed && "hidden"
+                    ]}>
+                      <div class="text-xs text-gray-500 mb-1">Input</div>
+                      <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">
+                        {msg.input}
+                      </div>
+                      <%= cond do %>
+                        <% is_nil(msg.output) -> %>
+                          <div class="text-xs text-gray-500 italic">Running...</div>
+                        <% msg.output == "" -> %>
+                          <div class="text-xs text-gray-500 italic mt-2">Completed</div>
+                        <% true -> %>
+                          <div>
+                            <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
+                            <div class={[
+                              "whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto",
+                              if(msg.is_error, do: "text-red-400", else: "text-gray-300")
+                            ]}>
+                              {msg.output}
+                            </div>
+                          </div>
+                      <% end %>
+                    </div>
+                  </div>
+                <% :assistant -> %>
+                  <div class={message_class(:assistant)}>
+                    <div class="text-xs text-gray-500 mb-1">assistant</div>
+                    <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
+                  </div>
+                <% _ -> %>
+                  <div class={message_class(msg.type)}>
+                    <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
+                    <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
+                  </div>
+              <% end %>
+            </div>
+          </div>
+          <!-- Typing indicator -->
+          <div
+            :if={@status == :processing and is_nil(@streaming_message_id)}
+            class="p-3 bg-gray-800 rounded-lg mr-4 sm:mr-8"
+          >
+            <div class="text-xs text-gray-500 mb-1">assistant</div>
+            <div class="typing-indicator">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
           </div>
         </div>
         
     <!-- Input -->
-        <div class="flex-none p-4 border-t border-gray-700">
+        <div class="flex-none p-4 border-t border-gray-700 safe-bottom">
           <form phx-submit="send" class="flex gap-2">
             <input
               type="text"
               name="message"
               value={@input}
               phx-change="update_input"
-              placeholder={if @status == :ready, do: "Type a message...", else: "Waiting..."}
-              disabled={@status not in [:ready, :processing]}
-              class="flex-1 px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg focus:outline-none focus:border-blue-500 disabled:opacity-50"
+              placeholder={input_placeholder(@status)}
+              disabled={@status in [:error, :disconnected]}
+              class="flex-1 px-4 py-2 text-base bg-gray-800 border border-gray-600 rounded-lg focus:outline-none focus:border-blue-500 disabled:opacity-50"
               autocomplete="off"
+              enterkeyhint="send"
             />
             <button
               type="submit"
-              disabled={@status not in [:ready, :processing] or @input == ""}
-              class="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-semibold transition-colors"
+              disabled={@status in [:error, :disconnected] or @input == ""}
+              class="px-6 py-3 touch-target tap-highlight bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-semibold transition-colors"
             >
               Send
             </button>
@@ -434,6 +453,19 @@ defmodule MiniMeWeb.TaskLive do
   defp extract_tool_output(%{stdout: stdout}) when is_binary(stdout), do: stdout
   defp extract_tool_output(%{stderr: stderr}) when is_binary(stderr) and stderr != "", do: stderr
   defp extract_tool_output(_result), do: ""
+
+  # Send any messages that were queued while the session was loading
+  defp flush_pending_messages(socket) do
+    pending = socket.assigns.pending_messages
+
+    if pending != [] and socket.assigns.session_pid do
+      Enum.each(pending, fn message ->
+        UserSession.send_message(socket.assigns.session_pid, message)
+      end)
+    end
+
+    assign(socket, :pending_messages, [])
+  end
 
   defp add_message(socket, type, content) do
     task_id = socket.assigns.task.id
@@ -488,8 +520,8 @@ defmodule MiniMeWeb.TaskLive do
     end
   end
 
-  defp message_class(:user), do: "p-3 bg-blue-900 rounded-lg ml-8"
-  defp message_class(:assistant), do: "p-3 bg-gray-800 rounded-lg mr-8"
+  defp message_class(:user), do: "p-3 bg-blue-900 rounded-lg ml-4 sm:ml-8"
+  defp message_class(:assistant), do: "p-3 bg-gray-800 rounded-lg mr-4 sm:mr-8"
   defp message_class(:system), do: "p-2 text-gray-400 text-center text-sm"
   defp message_class(:error), do: "p-3 bg-red-900 rounded-lg"
   defp message_class(_), do: "p-2 text-gray-400 text-sm"
@@ -512,6 +544,12 @@ defmodule MiniMeWeb.TaskLive do
   defp status_text(:initializing), do: "Initializing..."
   defp status_text(:idle), do: "Idle"
   defp status_text(status), do: to_string(status)
+
+  defp input_placeholder(:ready), do: "Type a message..."
+  defp input_placeholder(:processing), do: "Type a message..."
+  defp input_placeholder(:error), do: "Session error"
+  defp input_placeholder(:disconnected), do: "Disconnected"
+  defp input_placeholder(_), do: "Type a message (will send when ready)..."
 
   defp session_end_color("completed"), do: "text-green-500"
   defp session_end_color("failed"), do: "text-red-500"

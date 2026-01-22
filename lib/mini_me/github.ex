@@ -1,50 +1,67 @@
 defmodule MiniMe.GitHub do
   @moduledoc """
-  Wrapper for `gh` CLI commands.
-  Assumes gh CLI is installed and authenticated.
+  GitHub API client using HTTP requests.
+  Uses GITHUB_TOKEN for authentication.
   """
 
+  @base_url "https://api.github.com"
+
   @doc """
-  List user's repositories via gh CLI.
+  List user's repositories via GitHub API.
   Returns `{:ok, repos}` or `{:error, reason}`.
   """
   def list_repos(opts \\ []) do
     limit = Keyword.get(opts, :limit, 50)
 
-    args = [
-      "repo",
-      "list",
-      "--json",
-      "name,nameWithOwner,url,description,isPrivate,pushedAt",
-      "--limit",
-      to_string(limit)
-    ]
+    case get_token() do
+      nil ->
+        {:error, "GITHUB_TOKEN not configured"}
 
-    case System.cmd("gh", args, stderr_to_stdout: true) do
-      {output, 0} ->
-        case Jason.decode(output) do
-          {:ok, repos} ->
+      token ->
+        # Fetch repos sorted by most recently pushed
+        url = "#{@base_url}/user/repos"
+
+        params = [
+          sort: "pushed",
+          direction: "desc",
+          per_page: limit,
+          type: "all"
+        ]
+
+        case Req.get(url, headers: auth_headers(token), params: params) do
+          {:ok, %{status: 200, body: repos}} ->
             {:ok, format_repos(repos)}
 
-          {:error, _} ->
-            {:error, "Failed to parse gh output: #{output}"}
-        end
+          {:ok, %{status: status, body: body}} ->
+            {:error, "GitHub API error (#{status}): #{inspect(body)}"}
 
-      {error, _code} ->
-        {:error, error}
+          {:error, reason} ->
+            {:error, "Request failed: #{inspect(reason)}"}
+        end
     end
   end
 
   @doc """
-  Check if gh CLI is installed and authenticated.
+  Check if GitHub token is configured and valid.
   """
   def check_auth do
-    case System.cmd("gh", ["auth", "status"], stderr_to_stdout: true) do
-      {output, 0} ->
-        {:ok, output}
+    case get_token() do
+      nil ->
+        {:error, "GITHUB_TOKEN not configured"}
 
-      {error, _code} ->
-        {:error, error}
+      token ->
+        url = "#{@base_url}/user"
+
+        case Req.get(url, headers: auth_headers(token)) do
+          {:ok, %{status: 200, body: user}} ->
+            {:ok, "Authenticated as #{user["login"]}"}
+
+          {:ok, %{status: status, body: body}} ->
+            {:error, "GitHub API error (#{status}): #{inspect(body)}"}
+
+          {:error, reason} ->
+            {:error, "Request failed: #{inspect(reason)}"}
+        end
     end
   end
 
@@ -52,27 +69,42 @@ defmodule MiniMe.GitHub do
   Get repository details.
   """
   def get_repo(name_with_owner) do
-    args = [
-      "repo",
-      "view",
-      name_with_owner,
-      "--json",
-      "name,nameWithOwner,url,description,isPrivate,defaultBranchRef"
-    ]
+    case get_token() do
+      nil ->
+        {:error, "GITHUB_TOKEN not configured"}
 
-    case System.cmd("gh", args, stderr_to_stdout: true) do
-      {output, 0} ->
-        case Jason.decode(output) do
-          {:ok, repo} -> {:ok, format_repo(repo)}
-          {:error, _} -> {:error, "Failed to parse gh output"}
+      token ->
+        url = "#{@base_url}/repos/#{name_with_owner}"
+
+        case Req.get(url, headers: auth_headers(token)) do
+          {:ok, %{status: 200, body: repo}} ->
+            {:ok, format_repo(repo)}
+
+          {:ok, %{status: 404}} ->
+            {:error, "Repository not found: #{name_with_owner}"}
+
+          {:ok, %{status: status, body: body}} ->
+            {:error, "GitHub API error (#{status}): #{inspect(body)}"}
+
+          {:error, reason} ->
+            {:error, "Request failed: #{inspect(reason)}"}
         end
-
-      {error, _code} ->
-        {:error, error}
     end
   end
 
   # Private Functions
+
+  defp get_token do
+    Application.get_env(:mini_me, :github_token)
+  end
+
+  defp auth_headers(token) do
+    [
+      {"Authorization", "Bearer #{token}"},
+      {"Accept", "application/vnd.github+json"},
+      {"X-GitHub-Api-Version", "2022-11-28"}
+    ]
+  end
 
   defp format_repos(repos) do
     Enum.map(repos, &format_repo/1)
@@ -81,11 +113,11 @@ defmodule MiniMe.GitHub do
   defp format_repo(repo) do
     %{
       name: repo["name"],
-      full_name: repo["nameWithOwner"],
-      url: repo["url"],
+      full_name: repo["full_name"] || repo["nameWithOwner"],
+      url: repo["html_url"] || repo["url"],
       description: repo["description"],
-      private: repo["isPrivate"],
-      pushed_at: repo["pushedAt"]
+      private: repo["private"] || repo["isPrivate"],
+      pushed_at: repo["pushed_at"] || repo["pushedAt"]
     }
   end
 end

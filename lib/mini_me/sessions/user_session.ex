@@ -143,13 +143,24 @@ defmodule MiniMe.Sessions.UserSession do
     Logger.info("Claude Code connected for task #{state.task.id}")
 
     # Start a new execution session, tracking which sprite is used
-    {:ok, session} = Chat.start_execution_session(state.task.id, state.sprite_name, "claude_code")
-    broadcast(state, {:execution_session_started, session.id})
-    broadcast(state, {:session_status, :ready})
+    case Chat.start_execution_session(state.task.id, state.sprite_name, "claude_code") do
+      {:ok, session} ->
+        broadcast(state, {:execution_session_started, session.id})
+        broadcast(state, {:session_status, :ready})
 
-    state = %{state | status: :ready, execution_session_id: session.id}
-    state = process_queued_messages(state)
-    {:noreply, state}
+        state = %{state | status: :ready, execution_session_id: session.id}
+        state = process_queued_messages(state)
+        {:noreply, state}
+
+      {:error, changeset} ->
+        # Task was likely deleted while we were connecting
+        Logger.warning(
+          "Failed to start execution session for task #{state.task.id}: #{inspect(changeset.errors)}"
+        )
+
+        broadcast(state, {:agent_error, "Task no longer exists"})
+        {:stop, :normal, state}
+    end
   end
 
   def handle_info({:agent_status, :disconnected}, state) do

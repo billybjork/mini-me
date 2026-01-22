@@ -1,0 +1,57 @@
+# Ignore build output
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+
+# Ignore .fetch files
+.fetch
+
+# Ignore crash dumps
+erl_crash.dump
+
+# Ignore package tarball
+*.ez
+mini_me-*.tar
+
+# Ignore generated static assets (will be rebuilt)
+/priv/static/assets/
+/priv/static/cache_manifest.json
+
+# Ignore node modules if present
+/assets/node_modules/
+npm-debug.log
+
+# Ignore environment files
+.env
+.env.*
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore test files
+/test/
+
+# Ignore editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore Docker files (not needed in build context recursively)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Ignore CI/CD files
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Ignore documentation
+README*
+CHANGELOG*
+LICENSE*

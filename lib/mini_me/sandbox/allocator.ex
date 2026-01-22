@@ -75,34 +75,46 @@ defmodule MiniMe.Sandbox.Allocator do
       # Map of repo_id => task_id (which task has the lock)
       repo_locks: %{},
       # Map of task_id => %{sprite_name, repo_id, allocated_at}
-      allocations: %{}
+      allocations: %{},
+      # Map of task_id => %{sprite_name, working_dir} - cached prewarm results
+      prewarm_cache: %{},
+      # Set of task_ids currently being prewarmed
+      prewarming: MapSet.new(),
+      # Map of task_id => [{from, repo_id}] - callers waiting for prewarm to complete
+      prewarm_waiters: %{}
     }
 
     {:ok, state}
   end
 
   @impl true
-  def handle_call({:allocate, task}, _from, state) do
+  def handle_call({:allocate, task}, from, state) do
     repo_id = task.repo_id
 
     case check_and_acquire_lock(state, task.id, repo_id) do
       {:ok, state} ->
-        # Ensure sprite exists and repo is cloned
-        case setup_sprite_for_task(task) do
-          {:ok, sprite_name, working_dir} ->
+        # Check if prewarm already completed for this task
+        case Map.get(state.prewarm_cache, task.id) do
+          %{sprite_name: sprite_name, working_dir: working_dir} ->
+            # Use cached prewarm result
+            Logger.info("Using cached prewarm result for task #{task.id}")
+
             allocation = %{
               sprite_name: sprite_name,
               repo_id: repo_id,
               allocated_at: DateTime.utc_now()
             }
 
-            state = put_in(state.allocations[task.id], allocation)
+            state =
+              state
+              |> put_in([:allocations, task.id], allocation)
+              |> Map.update!(:prewarm_cache, &Map.delete(&1, task.id))
+
             {:reply, {:ok, %{sprite_name: sprite_name, working_dir: working_dir}}, state}
 
-          {:error, reason} ->
-            # Release lock on failure
-            state = release_lock(state, task.id, repo_id)
-            {:reply, {:error, reason}, state}
+          nil ->
+            # Check if prewarm is in progress - if so, queue this caller to be notified when done
+            handle_no_prewarm_cache(task, repo_id, from, state)
         end
 
       {:error, :repo_locked, locking_task_id} ->
@@ -115,18 +127,113 @@ defmodule MiniMe.Sandbox.Allocator do
     {:reply, locked, state}
   end
 
+  defp handle_no_prewarm_cache(task, repo_id, from, state) do
+    if MapSet.member?(state.prewarming, task.id) do
+      Logger.info("Prewarm in progress for task #{task.id}, waiting...")
+      state = add_prewarm_waiter(state, task.id, from, repo_id)
+      {:noreply, state}
+    else
+      do_allocate_setup(task, repo_id, from, state)
+    end
+  end
+
+  defp add_prewarm_waiter(state, task_id, from, repo_id) do
+    Map.update(state, :prewarm_waiters, %{task_id => [{from, repo_id}]}, fn waiters ->
+      Map.update(waiters, task_id, [{from, repo_id}], &[{from, repo_id} | &1])
+    end)
+  end
+
+  defp do_allocate_setup(task, repo_id, _from, state) do
+    # Ensure sprite exists and repo is cloned
+    case setup_sprite_for_task(task) do
+      {:ok, sprite_name, working_dir} ->
+        allocation = %{
+          sprite_name: sprite_name,
+          repo_id: repo_id,
+          allocated_at: DateTime.utc_now()
+        }
+
+        state = put_in(state.allocations[task.id], allocation)
+        {:reply, {:ok, %{sprite_name: sprite_name, working_dir: working_dir}}, state}
+
+      {:error, reason} ->
+        # Release lock on failure
+        state = release_lock(state, task.id, repo_id)
+        {:reply, {:error, reason}, state}
+    end
+  end
+
   @impl true
   def handle_cast({:prewarm, task}, state) do
-    # Pre-warm in background, don't block
+    # Mark as prewarming
+    state = Map.update!(state, :prewarming, &MapSet.put(&1, task.id))
+    allocator_pid = self()
+
+    # Pre-warm in background, cache result when done
     spawn(fn ->
       case setup_sprite_for_task(task) do
-        {:ok, _sprite_name, _working_dir} ->
+        {:ok, sprite_name, working_dir} ->
           Logger.info("Pre-warmed sprite for task #{task.id}")
+          GenServer.cast(allocator_pid, {:prewarm_complete, task.id, sprite_name, working_dir})
 
         {:error, reason} ->
           Logger.warning("Failed to pre-warm sprite for task #{task.id}: #{inspect(reason)}")
+          GenServer.cast(allocator_pid, {:prewarm_failed, task.id})
       end
     end)
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:prewarm_complete, task_id, sprite_name, working_dir}, state) do
+    # Reply to any waiters
+    waiters = Map.get(state.prewarm_waiters || %{}, task_id, [])
+
+    state =
+      Enum.reduce(waiters, state, fn {from, repo_id}, acc_state ->
+        allocation = %{
+          sprite_name: sprite_name,
+          repo_id: repo_id,
+          allocated_at: DateTime.utc_now()
+        }
+
+        GenServer.reply(from, {:ok, %{sprite_name: sprite_name, working_dir: working_dir}})
+        put_in(acc_state.allocations[task_id], allocation)
+      end)
+
+    # If there were waiters, don't cache (they consumed the result)
+    # If no waiters, cache for potential later use
+    state =
+      if waiters == [] do
+        Map.update!(
+          state,
+          :prewarm_cache,
+          &Map.put(&1, task_id, %{sprite_name: sprite_name, working_dir: working_dir})
+        )
+      else
+        state
+      end
+
+    state =
+      state
+      |> Map.update!(:prewarming, &MapSet.delete(&1, task_id))
+      |> Map.update(:prewarm_waiters, %{}, &Map.delete(&1, task_id))
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:prewarm_failed, task_id}, state) do
+    # Reply to any waiters with error
+    waiters = Map.get(state.prewarm_waiters || %{}, task_id, [])
+
+    Enum.each(waiters, fn {from, _repo_id} ->
+      GenServer.reply(from, {:error, :prewarm_failed})
+    end)
+
+    state =
+      state
+      |> Map.update!(:prewarming, &MapSet.delete(&1, task_id))
+      |> Map.update(:prewarm_waiters, %{}, &Map.delete(&1, task_id))
 
     {:noreply, state}
   end
