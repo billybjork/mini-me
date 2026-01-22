@@ -1,6 +1,6 @@
-defmodule MiniMeWeb.SessionLive do
+defmodule MiniMeWeb.TaskLive do
   @moduledoc """
-  Chat interface LiveView for interacting with Claude Code.
+  LiveView for a single task - chat interface for interacting with Claude Code.
   """
   use MiniMeWeb, :live_view
 
@@ -225,7 +225,7 @@ defmodule MiniMeWeb.SessionLive do
 
   def handle_info(msg, socket) do
     require Logger
-    Logger.debug("SessionLive received: #{inspect(msg)}")
+    Logger.debug("TaskLive received: #{inspect(msg)}")
     {:noreply, socket}
   end
 
@@ -234,7 +234,7 @@ defmodule MiniMeWeb.SessionLive do
     require Logger
 
     Logger.debug(
-      "SessionLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
+      "TaskLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
     )
 
     socket =
@@ -245,7 +245,7 @@ defmodule MiniMeWeb.SessionLive do
     if socket.assigns.session_pid do
       UserSession.send_message(socket.assigns.session_pid, message)
     else
-      Logger.warning("SessionLive.send: No session_pid, message dropped!")
+      Logger.warning("TaskLive.send: No session_pid, message dropped!")
     end
 
     {:noreply, push_event(socket, "scroll_bottom", %{})}

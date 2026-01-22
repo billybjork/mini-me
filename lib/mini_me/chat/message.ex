@@ -31,7 +31,7 @@ defmodule MiniMe.Chat.Message do
   end
 
   @doc """
-  Build a message struct for display (matches the in-memory format used by SessionLive).
+  Build a message struct for display (matches the in-memory format used by TaskLive).
   """
   def to_display(%__MODULE__{} = message) do
     base = %{

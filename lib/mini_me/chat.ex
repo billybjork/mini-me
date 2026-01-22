@@ -134,7 +134,7 @@ defmodule MiniMe.Chat do
   end
 
   @doc """
-  Get messages for display in SessionLive.
+  Get messages for display in TaskLive.
   Returns messages in the format expected by the LiveView.
   """
   def list_messages_for_display(task_id, opts \\ []) do

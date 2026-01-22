@@ -107,7 +107,7 @@ defmodule MiniMeWeb.HomeLive do
           task_with_repo = %{task | repo: repo}
           Allocator.allocate(task_with_repo, prewarm: true)
 
-          {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
+          {:noreply, push_navigate(socket, to: ~p"/tasks/#{task.id}")}
         else
           {:error, changeset} ->
             {:noreply,
@@ -120,7 +120,7 @@ defmodule MiniMeWeb.HomeLive do
     # Create a task without a repo
     case Tasks.create_task() do
       {:ok, task} ->
-        {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
+        {:noreply, push_navigate(socket, to: ~p"/tasks/#{task.id}")}
 
       {:error, changeset} ->
         {:noreply,
@@ -129,7 +129,7 @@ defmodule MiniMeWeb.HomeLive do
   end
 
   def handle_event("open_task", %{"id" => id}, socket) do
-    {:noreply, push_navigate(socket, to: ~p"/session/#{id}")}
+    {:noreply, push_navigate(socket, to: ~p"/tasks/#{id}")}
   end
 
   def handle_event("delete_task", %{"id" => id}, socket) do
