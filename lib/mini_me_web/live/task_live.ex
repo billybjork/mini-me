@@ -548,10 +548,18 @@ defmodule MiniMeWeb.TaskLive do
 
   defp render_markdown(content) when is_binary(content) do
     content
-    |> Earmark.as_html!(code_class_prefix: "language-")
+    |> Earmark.as_html!(
+      code_class_prefix: "language-",
+      registered_processors: [{"a", &open_links_in_new_tab/1}]
+    )
   end
 
   defp render_markdown(_), do: ""
+
+  defp open_links_in_new_tab({tag, attrs, children, meta}) do
+    new_attrs = [{"target", "_blank"}, {"rel", "noopener noreferrer"} | attrs]
+    {tag, new_attrs, children, meta}
+  end
 
   defp task_display_name(%{title: title}) when is_binary(title) and title != "", do: title
   defp task_display_name(%{repo: %{github_name: name}}) when is_binary(name), do: name
