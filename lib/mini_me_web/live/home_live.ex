@@ -1,26 +1,26 @@
 defmodule MiniMeWeb.HomeLive do
   @moduledoc """
-  Home page LiveView - displays repo selector and recent workspaces.
+  Home page LiveView - displays repo selector and recent tasks.
   """
   use MiniMeWeb, :live_view
 
   alias MiniMe.GitHub
   alias MiniMe.Sandbox.Client
-  alias MiniMe.Workspaces
+  alias MiniMe.Tasks
 
   # Poll for sprite status updates every 5 seconds
   @status_poll_interval :timer.seconds(5)
 
   @impl true
   def mount(_params, _session, socket) do
-    workspaces = Workspaces.list_workspaces()
-    workspaces_map = Map.new(workspaces, &{&1.id, &1})
+    tasks = Tasks.list_tasks()
+    tasks_map = Map.new(tasks, &{&1.id, &1})
 
     socket =
       socket
       |> assign(:repos, [])
-      |> stream(:workspaces, workspaces)
-      |> assign(:workspaces_map, workspaces_map)
+      |> stream(:tasks, tasks)
+      |> assign(:tasks_map, tasks_map)
       |> assign(:sprite_statuses, %{})
       |> assign(:loading, true)
       |> assign(:error, nil)
@@ -60,9 +60,9 @@ defmodule MiniMeWeb.HomeLive do
           socket.assigns.sprite_statuses
       end
 
-    # Also refresh workspaces in case they changed
-    workspaces = Workspaces.list_workspaces()
-    workspaces_map = Map.new(workspaces, &{&1.id, &1})
+    # Also refresh tasks in case they changed
+    tasks = Tasks.list_tasks()
+    tasks_map = Map.new(tasks, &{&1.id, &1})
 
     # Schedule next poll
     Process.send_after(self(), :load_sprite_statuses, @status_poll_interval)
@@ -70,22 +70,22 @@ defmodule MiniMeWeb.HomeLive do
     socket =
       socket
       |> assign(:sprite_statuses, sprite_statuses)
-      |> assign(:workspaces_map, workspaces_map)
-      |> stream(:workspaces, workspaces, reset: true)
+      |> assign(:tasks_map, tasks_map)
+      |> stream(:tasks, tasks, reset: true)
 
     {:noreply, socket}
   end
 
-  def handle_info({:workspace_deleted, workspace_id}, socket) do
-    case Map.get(socket.assigns.workspaces_map, workspace_id) do
+  def handle_info({:task_deleted, task_id}, socket) do
+    case Map.get(socket.assigns.tasks_map, task_id) do
       nil ->
         {:noreply, assign(socket, deleting: nil)}
 
-      workspace ->
+      task ->
         socket =
           socket
-          |> stream_delete(:workspaces, workspace)
-          |> update(:workspaces_map, &Map.delete(&1, workspace_id))
+          |> stream_delete(:tasks, task)
+          |> update(:tasks_map, &Map.delete(&1, task_id))
           |> assign(:deleting, nil)
 
         {:noreply, socket}
@@ -103,52 +103,52 @@ defmodule MiniMeWeb.HomeLive do
         {:noreply, put_flash(socket, :error, "Please select a repository")}
 
       %{url: url, name: name} ->
-        case Workspaces.find_or_create_workspace(url, name) do
-          {:ok, workspace} ->
-            {:noreply, push_navigate(socket, to: ~p"/session/#{workspace.id}")}
+        case Tasks.find_or_create_task(url, name) do
+          {:ok, task} ->
+            {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
 
           {:error, changeset} ->
             {:noreply,
-             put_flash(socket, :error, "Failed to create workspace: #{inspect(changeset.errors)}")}
+             put_flash(socket, :error, "Failed to create task: #{inspect(changeset.errors)}")}
         end
     end
   end
 
-  def handle_event("open_workspace", %{"id" => id}, socket) do
+  def handle_event("open_task", %{"id" => id}, socket) do
     {:noreply, push_navigate(socket, to: ~p"/session/#{id}")}
   end
 
-  def handle_event("delete_workspace", %{"id" => id}, socket) do
-    workspace_id = String.to_integer(id)
+  def handle_event("delete_task", %{"id" => id}, socket) do
+    task_id = String.to_integer(id)
 
-    # Guard against double-clicks - ignore if already deleting this workspace
-    if socket.assigns.deleting == workspace_id do
+    # Guard against double-clicks - ignore if already deleting this task
+    if socket.assigns.deleting == task_id do
       {:noreply, socket}
     else
-      socket.assigns.workspaces_map
-      |> Map.get(workspace_id)
-      |> do_delete_workspace(socket)
+      socket.assigns.tasks_map
+      |> Map.get(task_id)
+      |> do_delete_task(socket)
     end
   end
 
   def handle_event("sleep_sprite", %{"id" => id}, socket) do
-    socket.assigns.workspaces_map
+    socket.assigns.tasks_map
     |> Map.get(String.to_integer(id))
     |> do_sleep_sprite(socket)
   end
 
-  defp do_delete_workspace(nil, socket), do: {:noreply, socket}
+  defp do_delete_task(nil, socket), do: {:noreply, socket}
 
-  defp do_delete_workspace(workspace, socket) do
-    socket = assign(socket, deleting: workspace.id)
+  defp do_delete_task(task, socket) do
+    socket = assign(socket, deleting: task.id)
     liveview_pid = self()
 
-    # Delete sprite first, then workspace (in background)
+    # Delete sprite first, then task (in background)
     Task.start(fn ->
-      Client.delete_sprite(workspace.sprite_name)
+      Client.delete_sprite(task.sprite_name)
       # Use Repo.delete with allow_stale to handle race conditions
-      Workspaces.delete_workspace(workspace)
-      send(liveview_pid, {:workspace_deleted, workspace.id})
+      Tasks.delete_task(task)
+      send(liveview_pid, {:task_deleted, task.id})
     end)
 
     {:noreply, socket}
@@ -156,29 +156,29 @@ defmodule MiniMeWeb.HomeLive do
 
   defp do_sleep_sprite(nil, socket), do: {:noreply, socket}
 
-  defp do_sleep_sprite(workspace, socket) do
-    sprite_status = Map.get(socket.assigns.sprite_statuses, workspace.sprite_name)
+  defp do_sleep_sprite(task, socket) do
+    sprite_status = Map.get(socket.assigns.sprite_statuses, task.sprite_name)
 
     # Optimistic update - show transitional state
-    sprite_statuses = Map.put(socket.assigns.sprite_statuses, workspace.sprite_name, "suspending")
+    sprite_statuses = Map.put(socket.assigns.sprite_statuses, task.sprite_name, "suspending")
     socket = assign(socket, :sprite_statuses, sprite_statuses)
 
     # Only kill Claude if sprite is actually running (avoid waking it up)
-    maybe_kill_claude(workspace, sprite_status)
+    maybe_kill_claude(task, sprite_status)
 
     # Suspend in background - the regular poll will refresh the status
-    Task.start(fn -> Client.suspend_sprite(workspace.sprite_name) end)
+    Task.start(fn -> Client.suspend_sprite(task.sprite_name) end)
 
     {:noreply, socket}
   end
 
-  defp maybe_kill_claude(workspace, "running") do
+  defp maybe_kill_claude(task, "running") do
     Task.start(fn ->
-      Client.exec(workspace.sprite_name, "pkill -f 'claude --print' || true", timeout: 5_000)
+      Client.exec(task.sprite_name, "pkill -f 'claude --print' || true", timeout: 5_000)
     end)
   end
 
-  defp maybe_kill_claude(_workspace, _status), do: :ok
+  defp maybe_kill_claude(_task, _status), do: :ok
 
   @impl true
   def render(assigns) do
@@ -187,39 +187,39 @@ defmodule MiniMeWeb.HomeLive do
       <div class="min-h-screen bg-gray-900 text-white">
         <div class="max-w-4xl mx-auto px-4 py-8">
           <h1 class="text-3xl font-bold mb-8">Mini Me</h1>
-          
-    <!-- Recent Workspaces -->
-          <div :if={map_size(@workspaces_map) > 0} class="mb-8">
-            <h2 class="text-xl font-semibold mb-4">Recent Workspaces</h2>
-            <div class="space-y-2" id="workspaces" phx-update="stream">
+
+    <!-- Recent Tasks -->
+          <div :if={map_size(@tasks_map) > 0} class="mb-8">
+            <h2 class="text-xl font-semibold mb-4">Recent Tasks</h2>
+            <div class="space-y-2" id="tasks" phx-update="stream">
               <div
-                :for={{dom_id, workspace} <- @streams.workspaces}
+                :for={{dom_id, task} <- @streams.tasks}
                 id={dom_id}
                 class="flex items-center gap-2"
               >
                 <button
-                  phx-click="open_workspace"
-                  phx-value-id={workspace.id}
+                  phx-click="open_task"
+                  phx-value-id={task.id}
                   class="flex-1 text-left p-4 bg-gray-800 rounded-lg hover:bg-gray-700 transition-colors"
                 >
                   <div class="flex items-center justify-between">
-                    <div class="font-medium">{workspace.github_repo_name}</div>
+                    <div class="font-medium">{task.github_repo_name}</div>
                     <.sprite_status_badge
-                      sprite_name={workspace.sprite_name}
+                      sprite_name={task.sprite_name}
                       sprite_statuses={@sprite_statuses}
                     />
                   </div>
                   <div class="text-sm text-gray-400 mt-1">
-                    <.workspace_status_text
-                      status={workspace.status}
-                      sprite_status={Map.get(@sprite_statuses, workspace.sprite_name)}
+                    <.task_status_text
+                      status={task.status}
+                      sprite_status={Map.get(@sprite_statuses, task.sprite_name)}
                     />
                   </div>
                 </button>
                 <button
-                  :if={Map.get(@sprite_statuses, workspace.sprite_name) in ["running"]}
+                  :if={Map.get(@sprite_statuses, task.sprite_name) in ["running"]}
                   phx-click="sleep_sprite"
-                  phx-value-id={workspace.id}
+                  phx-value-id={task.id}
                   phx-disable-with="..."
                   class="p-3 rounded-lg transition-colors bg-gray-800 hover:bg-blue-900 text-gray-400 hover:text-blue-400"
                   title="Put sprite to sleep (stops charges)"
@@ -227,21 +227,21 @@ defmodule MiniMeWeb.HomeLive do
                   ⏸
                 </button>
                 <button
-                  phx-click="delete_workspace"
-                  phx-value-id={workspace.id}
+                  phx-click="delete_task"
+                  phx-value-id={task.id}
                   phx-disable-with="..."
-                  data-confirm="Delete this workspace and its sprite? This cannot be undone."
+                  data-confirm="Delete this task and its sprite? This cannot be undone."
                   class={[
                     "p-3 rounded-lg transition-colors",
-                    if(@deleting == workspace.id,
+                    if(@deleting == task.id,
                       do: "bg-gray-700 text-gray-500 cursor-wait",
                       else: "bg-gray-800 hover:bg-red-900 text-gray-400 hover:text-red-400"
                     )
                   ]}
-                  disabled={@deleting == workspace.id}
-                  title="Delete workspace and sprite"
+                  disabled={@deleting == task.id}
+                  title="Delete task and sprite"
                 >
-                  {if @deleting == workspace.id, do: "...", else: "×"}
+                  {if @deleting == task.id, do: "...", else: "×"}
                 </button>
               </div>
             </div>
@@ -345,12 +345,12 @@ defmodule MiniMeWeb.HomeLive do
   defp sprite_status_text(nil), do: "?"
   defp sprite_status_text(status), do: status
 
-  # Component for workspace status text
+  # Component for task status text
   attr :status, :string, required: true
   attr :sprite_status, :string, default: nil
 
-  defp workspace_status_text(assigns) do
-    # Detect stale status: sprite is cold but workspace is in an intermediate state
+  defp task_status_text(assigns) do
+    # Detect stale status: sprite is cold but task is in an intermediate state
     is_stale = assigns.sprite_status == "cold" and assigns.status in ["creating", "cloning"]
 
     assigns = assign(assigns, :is_stale, is_stale)
@@ -359,21 +359,21 @@ defmodule MiniMeWeb.HomeLive do
     <span :if={@is_stale} class="text-orange-400">
       Setup interrupted - will resume on open
     </span>
-    <span :if={!@is_stale} class={workspace_status_classes(@status)}>
-      {workspace_status_label(@status)}
+    <span :if={!@is_stale} class={task_status_classes(@status)}>
+      {task_status_label(@status)}
     </span>
     """
   end
 
-  defp workspace_status_classes("ready"), do: "text-green-400"
-  defp workspace_status_classes("error"), do: "text-red-400"
-  defp workspace_status_classes("pending"), do: "text-gray-500"
-  defp workspace_status_classes(_), do: "text-yellow-400"
+  defp task_status_classes("ready"), do: "text-green-400"
+  defp task_status_classes("error"), do: "text-red-400"
+  defp task_status_classes("pending"), do: "text-gray-500"
+  defp task_status_classes(_), do: "text-yellow-400"
 
-  defp workspace_status_label("ready"), do: "Ready"
-  defp workspace_status_label("pending"), do: "Pending"
-  defp workspace_status_label("creating"), do: "Creating sprite..."
-  defp workspace_status_label("cloning"), do: "Cloning repo..."
-  defp workspace_status_label("error"), do: "Error"
-  defp workspace_status_label(status), do: status
+  defp task_status_label("ready"), do: "Ready"
+  defp task_status_label("pending"), do: "Pending"
+  defp task_status_label("creating"), do: "Creating sprite..."
+  defp task_status_label("cloning"), do: "Cloning repo..."
+  defp task_status_label("error"), do: "Error"
+  defp task_status_label(status), do: status
 end

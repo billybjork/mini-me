@@ -4,16 +4,16 @@ defmodule MiniMeWeb.SessionLive do
   """
   use MiniMeWeb, :live_view
 
-  alias MiniMe.Workspaces
+  alias MiniMe.Tasks
   alias MiniMe.Sessions.{Registry, UserSession}
   alias MiniMe.Chat
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do
-    workspace = Workspaces.get_workspace!(id)
+    task = Tasks.get_task!(id)
 
     # Load persisted messages
-    messages = Chat.list_messages_for_display(workspace.id)
+    messages = Chat.list_messages_for_display(task.id)
 
     # Build a map of messages that may need updates (tool_call messages)
     messages_map =
@@ -23,7 +23,7 @@ defmodule MiniMeWeb.SessionLive do
 
     socket =
       socket
-      |> assign(:workspace, workspace)
+      |> assign(:task, task)
       |> stream(:messages, messages)
       |> assign(:messages_map, messages_map)
       |> assign(:status, :initializing)
@@ -36,7 +36,7 @@ defmodule MiniMeWeb.SessionLive do
 
     if connected?(socket) do
       # Subscribe to session events
-      Phoenix.PubSub.subscribe(MiniMe.PubSub, UserSession.pubsub_topic(workspace.id))
+      Phoenix.PubSub.subscribe(MiniMe.PubSub, UserSession.pubsub_topic(task.id))
 
       # Start or find existing session
       send(self(), :ensure_session)
@@ -47,9 +47,9 @@ defmodule MiniMeWeb.SessionLive do
 
   @impl true
   def handle_info(:ensure_session, socket) do
-    workspace = socket.assigns.workspace
+    task = socket.assigns.task
 
-    case Registry.lookup(workspace.id) do
+    case Registry.lookup(task.id) do
       {:ok, pid} ->
         # Session exists, monitor it and get its status
         Process.monitor(pid)
@@ -67,7 +67,7 @@ defmodule MiniMeWeb.SessionLive do
         # Start new session
         case DynamicSupervisor.start_child(
                MiniMe.SessionSupervisor,
-               {UserSession, workspace}
+               {UserSession, task}
              ) do
           {:ok, pid} ->
             Process.monitor(pid)
@@ -137,14 +137,14 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   def handle_info({:tool_use, tool}, socket) do
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     execution_session_id = socket.assigns.execution_session_id
     formatted_input = format_tool_input(tool.name, tool.input)
 
     # Persist to database
     {:ok, db_message} =
       Chat.create_message(%{
-        workspace_id: workspace_id,
+        task_id: task_id,
         execution_session_id: execution_session_id,
         type: "tool_call",
         tool_data: %{
@@ -184,10 +184,10 @@ defmodule MiniMeWeb.SessionLive do
       end)
 
     # Persist tool result to database
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     output = extract_tool_output(result)
 
-    if tool_msg = Chat.find_tool_message(workspace_id, result.tool_use_id) do
+    if tool_msg = Chat.find_tool_message(task_id, result.tool_use_id) do
       Chat.update_tool_result(tool_msg.id, output, result.is_error)
     end
 
@@ -300,7 +300,7 @@ defmodule MiniMeWeb.SessionLive do
         <header class="flex-none p-4 border-b border-gray-700">
           <div class="flex items-center justify-between">
             <div>
-              <h1 class="text-lg font-semibold">{@workspace.github_repo_name}</h1>
+              <h1 class="text-lg font-semibold">{@task.github_repo_name}</h1>
               <div class="text-sm text-gray-400">
                 <span class={status_color(@status)}>{status_text(@status)}</span>
                 <span :if={@current_tool} class="ml-2 text-yellow-400">
@@ -428,13 +428,13 @@ defmodule MiniMeWeb.SessionLive do
   defp extract_tool_output(_result), do: "(no output)"
 
   defp add_message(socket, type, content) do
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     execution_session_id = socket.assigns.execution_session_id
 
     # Persist to database
     {:ok, db_message} =
       Chat.create_message(%{
-        workspace_id: workspace_id,
+        task_id: task_id,
         execution_session_id: execution_session_id,
         type: to_string(type),
         content: content
@@ -460,12 +460,12 @@ defmodule MiniMeWeb.SessionLive do
       |> stream_insert(:messages, updated_msg)
     else
       # Create a new assistant message
-      workspace_id = socket.assigns.workspace.id
+      task_id = socket.assigns.task.id
       execution_session_id = socket.assigns.execution_session_id
 
       {:ok, db_message} =
         Chat.create_message(%{
-          workspace_id: workspace_id,
+          task_id: task_id,
           execution_session_id: execution_session_id,
           type: "assistant",
           content: text

@@ -17,7 +17,7 @@ defmodule MiniMe.Chat.ExecutionSession do
     field :ended_at, :utc_datetime_usec
     field :metadata, :map, default: %{}
 
-    belongs_to :workspace, MiniMe.Workspaces.Workspace
+    belongs_to :task, MiniMe.Tasks.Task
     has_many :messages, MiniMe.Chat.Message
 
     timestamps()
@@ -25,15 +25,15 @@ defmodule MiniMe.Chat.ExecutionSession do
 
   def changeset(session, attrs) do
     session
-    |> cast(attrs, [:workspace_id, :session_type, :status, :started_at, :ended_at, :metadata])
-    |> validate_required([:workspace_id, :session_type, :status, :started_at])
+    |> cast(attrs, [:task_id, :session_type, :status, :started_at, :ended_at, :metadata])
+    |> validate_required([:task_id, :session_type, :status, :started_at])
     |> validate_inclusion(:status, @statuses)
-    |> foreign_key_constraint(:workspace_id)
+    |> foreign_key_constraint(:task_id)
   end
 
-  def start_changeset(workspace_id, session_type \\ "claude_code") do
+  def start_changeset(task_id, session_type \\ "claude_code") do
     changeset(%__MODULE__{}, %{
-      workspace_id: workspace_id,
+      task_id: task_id,
       session_type: session_type,
       status: "started",
       started_at: DateTime.utc_now()

@@ -1,11 +1,14 @@
-defmodule MiniMe.Workspaces.Workspace do
+defmodule MiniMe.Tasks.Task do
   @moduledoc """
-  Schema representing a workspace with a cloned GitHub repo in a Sprite VM.
+  Schema representing a task with a cloned GitHub repo in a Sprite VM.
+
+  A task represents a user's work session - it connects a GitHub repository
+  to a Sprite environment where Claude can work on the code.
   """
   use Ecto.Schema
   import Ecto.Changeset
 
-  schema "workspaces" do
+  schema "tasks" do
     field :github_repo_url, :string
     field :github_repo_name, :string
     field :sprite_name, :string
@@ -17,10 +20,10 @@ defmodule MiniMe.Workspaces.Workspace do
   end
 
   @doc """
-  Changeset for creating a new workspace.
+  Changeset for creating a new task.
   """
-  def changeset(workspace, attrs) do
-    workspace
+  def changeset(task, attrs) do
+    task
     |> cast(attrs, [
       :github_repo_url,
       :github_repo_name,
@@ -35,10 +38,10 @@ defmodule MiniMe.Workspaces.Workspace do
   end
 
   @doc """
-  Changeset for updating workspace status.
+  Changeset for updating task status.
   """
-  def status_changeset(workspace, attrs) do
-    workspace
+  def status_changeset(task, attrs) do
+    task
     |> cast(attrs, [:status, :error_message])
     |> validate_inclusion(:status, ["pending", "creating", "cloning", "ready", "error"])
   end

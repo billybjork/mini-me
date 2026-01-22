@@ -13,7 +13,7 @@ defmodule MiniMe.Sessions.UserSession do
 
   alias MiniMe.Sandbox.{Client, Process}
   alias MiniMe.Sessions.Registry
-  alias MiniMe.Workspaces
+  alias MiniMe.Tasks
   alias MiniMe.Transform.Pipeline
   alias MiniMe.Chat
 
@@ -22,7 +22,7 @@ defmodule MiniMe.Sessions.UserSession do
   @idle_timeout :timer.minutes(2)
 
   defstruct [
-    :workspace,
+    :task,
     :process_pid,
     :execution_session_id,
     :idle_timer,
@@ -33,10 +33,10 @@ defmodule MiniMe.Sessions.UserSession do
   # Client API
 
   @doc """
-  Start a new user session for a workspace.
+  Start a new user session for a task.
   """
-  def start_link(workspace) do
-    GenServer.start_link(__MODULE__, workspace)
+  def start_link(task) do
+    GenServer.start_link(__MODULE__, task)
   end
 
   @doc """
@@ -68,21 +68,21 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   @doc """
-  Get the PubSub topic for a workspace.
+  Get the PubSub topic for a task.
   """
-  def pubsub_topic(workspace_id) do
-    "session:#{workspace_id}"
+  def pubsub_topic(task_id) do
+    "session:#{task_id}"
   end
 
   # Server Implementation
 
   @impl true
-  def init(workspace) do
+  def init(task) do
     # Register in the registry
-    Registry.register(workspace.id)
+    Registry.register(task.id)
 
     state = %__MODULE__{
-      workspace: workspace
+      task: task
     }
 
     # Start initialization asynchronously
@@ -128,26 +128,26 @@ defmodule MiniMe.Sessions.UserSession do
   def handle_info(:initialize, state) do
     broadcast(state, {:session_status, :connecting})
 
-    case setup_sprite(state.workspace) do
-      {:ok, updated_workspace} ->
-        state = %{state | workspace: updated_workspace}
+    case setup_sprite(state.task) do
+      {:ok, updated_task} ->
+        state = %{state | task: updated_task}
         broadcast(state, {:session_status, :cloning})
 
-        case clone_repo(state.workspace) do
+        case clone_repo(state.task) do
           :ok ->
             broadcast(state, {:session_status, :starting_claude})
             start_claude_code(state)
 
           {:error, reason} ->
             Logger.error("Failed to clone repo: #{inspect(reason)}")
-            Workspaces.update_status(state.workspace, "error", inspect(reason))
+            Tasks.update_status(state.task, "error", inspect(reason))
             broadcast(state, {:agent_error, "Failed to clone repository"})
             {:noreply, %{state | status: :error}}
         end
 
       {:error, reason} ->
         Logger.error("Failed to setup sprite: #{inspect(reason)}")
-        Workspaces.update_status(state.workspace, "error", inspect(reason))
+        Tasks.update_status(state.task, "error", inspect(reason))
         broadcast(state, {:agent_error, "Failed to create sandbox"})
         {:noreply, %{state | status: :error}}
     end
@@ -155,11 +155,11 @@ defmodule MiniMe.Sessions.UserSession do
 
   # Agent status updates from Sandbox.Process
   def handle_info({:agent_status, :connected}, state) do
-    Logger.info("Claude Code connected for workspace #{state.workspace.id}")
-    Workspaces.update_status(state.workspace, "ready")
+    Logger.info("Claude Code connected for task #{state.task.id}")
+    Tasks.update_status(state.task, "ready")
 
     # Start a new execution session
-    {:ok, session} = Chat.start_execution_session(state.workspace.id, "claude_code")
+    {:ok, session} = Chat.start_execution_session(state.task.id, "claude_code")
     broadcast(state, {:execution_session_started, session.id})
     broadcast(state, {:session_status, :ready})
 
@@ -169,7 +169,7 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   def handle_info({:agent_status, :disconnected}, state) do
-    Logger.warning("Claude Code disconnected for workspace #{state.workspace.id}")
+    Logger.warning("Claude Code disconnected for task #{state.task.id}")
     broadcast(state, {:session_status, :disconnected})
     {:noreply, %{state | status: :disconnected}}
   end
@@ -256,33 +256,33 @@ defmodule MiniMe.Sessions.UserSession do
 
   # Private Functions
 
-  defp setup_sprite(workspace) do
-    Logger.info("Setting up sprite for workspace #{workspace.id}")
-    Workspaces.update_status(workspace, "creating")
+  defp setup_sprite(task) do
+    Logger.info("Setting up sprite for task #{task.id}")
+    Tasks.update_status(task, "creating")
 
-    case Client.create_sprite(workspace.sprite_name) do
+    case Client.create_sprite(task.sprite_name) do
       {:ok, _sprite} ->
-        {:ok, workspace}
+        {:ok, task}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp clone_repo(workspace) do
-    Logger.info("Checking/cloning repo #{workspace.github_repo_name}")
-    Workspaces.update_status(workspace, "cloning")
+  defp clone_repo(task) do
+    Logger.info("Checking/cloning repo #{task.github_repo_name}")
+    Tasks.update_status(task, "cloning")
 
     # Configure git credentials for GitHub (enables clone, pull, push)
-    :ok = configure_git_credentials(workspace.sprite_name)
+    :ok = configure_git_credentials(task.sprite_name)
 
     # Check if repo is already cloned
-    case Client.exec(workspace.sprite_name, "test -d #{workspace.working_dir}/.git") do
+    case Client.exec(task.sprite_name, "test -d #{task.working_dir}/.git") do
       {:ok, %{"exit_code" => 0}} ->
         # Repo already exists, just pull latest
         Logger.info("Repo already cloned, pulling latest")
 
-        case Client.exec(workspace.sprite_name, "cd #{workspace.working_dir} && git pull",
+        case Client.exec(task.sprite_name, "cd #{task.working_dir} && git pull",
                timeout: 120_000
              ) do
           {:ok, %{"exit_code" => 0}} -> :ok
@@ -292,9 +292,9 @@ defmodule MiniMe.Sessions.UserSession do
 
       _ ->
         # Clone the repo
-        clone_cmd = "git clone #{workspace.github_repo_url} #{workspace.working_dir}"
+        clone_cmd = "git clone #{task.github_repo_url} #{task.working_dir}"
 
-        case Client.exec(workspace.sprite_name, clone_cmd, timeout: 300_000) do
+        case Client.exec(task.sprite_name, clone_cmd, timeout: 300_000) do
           {:ok, %{"exit_code" => 0}} -> :ok
           {:ok, %{"exit_code" => _, "output" => output}} -> {:error, output}
           {:error, reason} -> {:error, reason}
@@ -335,20 +335,20 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   defp start_claude_code(state) do
-    Logger.info("Starting Claude Code for workspace #{state.workspace.id}")
+    Logger.info("Starting Claude Code for task #{state.task.id}")
 
     case Process.start_link(
-           sprite_name: state.workspace.sprite_name,
+           sprite_name: state.task.sprite_name,
            session_pid: self(),
-           working_dir: state.workspace.working_dir,
-           repo_name: state.workspace.github_repo_name
+           working_dir: state.task.working_dir,
+           repo_name: state.task.github_repo_name
          ) do
       {:ok, pid} ->
         {:noreply, %{state | process_pid: pid, status: :connecting}}
 
       {:error, reason} ->
         Logger.error("Failed to start Claude Code: #{inspect(reason)}")
-        Workspaces.update_status(state.workspace, "error", inspect(reason))
+        Tasks.update_status(state.task, "error", inspect(reason))
         broadcast(state, {:agent_error, "Failed to start Claude Code"})
         {:noreply, %{state | status: :error}}
     end
@@ -363,10 +363,10 @@ defmodule MiniMe.Sessions.UserSession do
     broadcast(state, {:session_status, :starting_claude})
 
     case Process.start_link(
-           sprite_name: state.workspace.sprite_name,
+           sprite_name: state.task.sprite_name,
            session_pid: self(),
-           working_dir: state.workspace.working_dir,
-           repo_name: state.workspace.github_repo_name
+           working_dir: state.task.working_dir,
+           repo_name: state.task.github_repo_name
          ) do
       {:ok, pid} ->
         %{state | process_pid: pid, status: :connecting}
@@ -475,7 +475,7 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   defp broadcast(state, message) do
-    Phoenix.PubSub.broadcast(@pubsub, pubsub_topic(state.workspace.id), message)
+    Phoenix.PubSub.broadcast(@pubsub, pubsub_topic(state.task.id), message)
   end
 
   defp cancel_idle_timer(%{idle_timer: nil} = state), do: state
