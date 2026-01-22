@@ -103,7 +103,9 @@ defmodule MiniMe.Chat do
         {:error, :not_found}
 
       message ->
-        tool_data = Map.merge(message.tool_data || %{}, %{"output" => output, "is_error" => is_error})
+        tool_data =
+          Map.merge(message.tool_data || %{}, %{"output" => output, "is_error" => is_error})
+
         update_message(message, %{tool_data: tool_data})
     end
   end

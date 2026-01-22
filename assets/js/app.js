@@ -19,6 +19,32 @@
 
 // Include phoenix_html to handle method=PUT/DELETE in forms and buttons.
 import "phoenix_html"
+
+// Theme handling - must run early before DOM is ready
+const setTheme = (theme) => {
+  if (theme === "system") {
+    localStorage.removeItem("phx:theme")
+    document.documentElement.removeAttribute("data-theme")
+  } else {
+    localStorage.setItem("phx:theme", theme)
+    document.documentElement.setAttribute("data-theme", theme)
+  }
+}
+
+// Apply theme on initial load if not already set
+if (!document.documentElement.hasAttribute("data-theme")) {
+  setTheme(localStorage.getItem("phx:theme") || "system")
+}
+
+// Listen for theme changes from other tabs
+window.addEventListener("storage", (e) => {
+  if (e.key === "phx:theme") {
+    setTheme(e.newValue || "system")
+  }
+})
+
+// Listen for theme toggle events from LiveView
+window.addEventListener("phx:set-theme", (e) => setTheme(e.target.dataset.phxTheme))
 // Establish Phoenix Socket and LiveView configuration.
 import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"

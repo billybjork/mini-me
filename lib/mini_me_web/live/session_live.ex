@@ -15,16 +15,24 @@ defmodule MiniMeWeb.SessionLive do
     # Load persisted messages
     messages = Chat.list_messages_for_display(workspace.id)
 
+    # Build a map of messages that may need updates (tool_call messages)
+    messages_map =
+      messages
+      |> Enum.filter(&(&1.type == :tool_call))
+      |> Map.new(&{&1.id, &1})
+
     socket =
       socket
       |> assign(:workspace, workspace)
-      |> assign(:messages, messages)
+      |> stream(:messages, messages)
+      |> assign(:messages_map, messages_map)
       |> assign(:status, :initializing)
       |> assign(:current_tool, nil)
       |> assign(:input, "")
       |> assign(:session_pid, nil)
       |> assign(:execution_session_id, nil)
       |> assign(:streaming_message_id, nil)
+      |> assign(:streaming_message, nil)
 
     if connected?(socket) do
       # Subscribe to session events
@@ -153,14 +161,27 @@ defmodule MiniMeWeb.SessionLive do
     socket =
       socket
       |> assign(:current_tool, tool.name)
-      |> update(:messages, fn messages -> messages ++ [message] end)
+      |> stream_insert(:messages, message)
+      |> update(:messages_map, &Map.put(&1, message.id, message))
 
     {:noreply, push_event(socket, "scroll_bottom", %{})}
   end
 
   def handle_info({:tool_result, result}, socket) do
-    # Update in-memory messages
-    socket = update(socket, :messages, &apply_tool_result(&1, result))
+    # Find and update the tool message in our map
+    messages_map = socket.assigns.messages_map
+
+    socket =
+      Enum.find_value(messages_map, socket, fn {_id, msg} ->
+        if msg.tool_use_id == result.tool_use_id do
+          output = extract_tool_output(result)
+          updated_msg = %{msg | output: output, is_error: result.is_error}
+
+          socket
+          |> stream_insert(:messages, updated_msg)
+          |> update(:messages_map, &Map.put(&1, msg.id, updated_msg))
+        end
+      end)
 
     # Persist tool result to database
     workspace_id = socket.assigns.workspace.id
@@ -174,7 +195,8 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   def handle_info({:agent_done}, socket) do
-    {:noreply, assign(socket, current_tool: nil, streaming_message_id: nil)}
+    {:noreply,
+     assign(socket, current_tool: nil, streaming_message_id: nil, streaming_message: nil)}
   end
 
   def handle_info({:agent_error, reason}, socket) do
@@ -213,7 +235,10 @@ defmodule MiniMeWeb.SessionLive do
   @impl true
   def handle_event("send", %{"message" => message}, socket) when message != "" do
     require Logger
-    Logger.debug("SessionLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}")
+
+    Logger.debug(
+      "SessionLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
+    )
 
     socket =
       socket
@@ -245,152 +270,158 @@ defmodule MiniMeWeb.SessionLive do
 
   def handle_event("toggle_tool", %{"id" => id}, socket) do
     id = String.to_integer(id)
-    socket = update(socket, :messages, &toggle_tool_message(&1, id))
-    {:noreply, socket}
+
+    case Map.get(socket.assigns.messages_map, id) do
+      nil ->
+        {:noreply, socket}
+
+      msg ->
+        updated_msg = %{msg | collapsed: !msg.collapsed}
+
+        socket =
+          socket
+          |> stream_insert(:messages, updated_msg)
+          |> update(:messages_map, &Map.put(&1, id, updated_msg))
+
+        {:noreply, socket}
+    end
   end
 
   @impl true
   def render(assigns) do
     ~H"""
-    <div
-      class="flex flex-col h-screen bg-gray-900 text-white"
-      id="session-container"
-      phx-hook="ScrollBottom"
-    >
-      <!-- Header -->
-      <header class="flex-none p-4 border-b border-gray-700">
-        <div class="flex items-center justify-between">
-          <div>
-            <h1 class="text-lg font-semibold">{@workspace.github_repo_name}</h1>
-            <div class="text-sm text-gray-400">
-              <span class={status_color(@status)}>{status_text(@status)}</span>
-              <span :if={@current_tool} class="ml-2 text-yellow-400">
-                Running: {@current_tool}
-              </span>
+    <Layouts.full_screen flash={@flash}>
+      <div
+        class="flex flex-col h-screen bg-gray-900 text-white"
+        id="session-container"
+        phx-hook="ScrollBottom"
+      >
+        <!-- Header -->
+        <header class="flex-none p-4 border-b border-gray-700">
+          <div class="flex items-center justify-between">
+            <div>
+              <h1 class="text-lg font-semibold">{@workspace.github_repo_name}</h1>
+              <div class="text-sm text-gray-400">
+                <span class={status_color(@status)}>{status_text(@status)}</span>
+                <span :if={@current_tool} class="ml-2 text-yellow-400">
+                  Running: {@current_tool}
+                </span>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <button
+                :if={@status == :processing}
+                phx-click="interrupt"
+                class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm"
+              >
+                Interrupt
+              </button>
+              <.link navigate={~p"/"} class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+                Back
+              </.link>
             </div>
           </div>
-          <div class="flex gap-2">
-            <button
-              :if={@status == :processing}
-              phx-click="interrupt"
-              class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm"
-            >
-              Interrupt
-            </button>
-            <.link navigate={~p"/"} class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">
-              Back
-            </.link>
+        </header>
+        
+    <!-- Messages -->
+        <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messages" phx-update="stream">
+          <div :for={{dom_id, msg} <- @streams.messages} id={dom_id}>
+            <%= case msg.type do %>
+              <% :session_start -> %>
+                <div class="flex items-center gap-3 py-2">
+                  <div class="flex-1 h-px bg-green-700"></div>
+                  <span class="text-xs text-green-500 font-medium px-2">
+                    Claude Code Session Started
+                  </span>
+                  <div class="flex-1 h-px bg-green-700"></div>
+                </div>
+              <% :session_end -> %>
+                <div class="flex items-center gap-3 py-2">
+                  <div class="flex-1 h-px bg-gray-600"></div>
+                  <span class={"text-xs font-medium px-2 #{session_end_color(msg.content)}"}>
+                    Session {session_end_text(msg.content)}
+                  </span>
+                  <div class="flex-1 h-px bg-gray-600"></div>
+                </div>
+              <% :tool_call -> %>
+                <div class="border border-gray-700 rounded-lg overflow-hidden">
+                  <button
+                    phx-click="toggle_tool"
+                    phx-value-id={msg.id}
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
+                  >
+                    <span
+                      class="text-gray-500 transition-transform duration-200"
+                      style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}
+                    >
+                      ▶
+                    </span>
+                    <span class="text-yellow-400 font-medium">{msg.name}</span>
+                    <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
+                    <span :if={msg.is_error} class="text-red-400 text-xs">error</span>
+                  </button>
+                  <div class={[
+                    "px-3 py-2 bg-gray-900 border-t border-gray-700",
+                    msg.collapsed && "hidden"
+                  ]}>
+                    <div class="text-xs text-gray-500 mb-1">Input</div>
+                    <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">
+                      {msg.input}
+                    </div>
+                    <div :if={msg.output}>
+                      <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
+                      <div class={[
+                        "whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto",
+                        if(msg.is_error, do: "text-red-400", else: "text-gray-300")
+                      ]}>
+                        {msg.output}
+                      </div>
+                    </div>
+                    <div :if={!msg.output} class="text-xs text-gray-500 italic">Running...</div>
+                  </div>
+                </div>
+              <% :assistant -> %>
+                <div class={message_class(:assistant)}>
+                  <div class="text-xs text-gray-500 mb-1">assistant</div>
+                  <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
+                </div>
+              <% _ -> %>
+                <div class={message_class(msg.type)}>
+                  <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
+                  <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
+                </div>
+            <% end %>
           </div>
         </div>
-      </header>
-      
-    <!-- Messages -->
-      <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messages">
-        <%= for msg <- @messages do %>
-          <%= case msg.type do %>
-            <% :session_start -> %>
-              <div class="flex items-center gap-3 py-2">
-                <div class="flex-1 h-px bg-green-700"></div>
-                <span class="text-xs text-green-500 font-medium px-2">Claude Code Session Started</span>
-                <div class="flex-1 h-px bg-green-700"></div>
-              </div>
-
-            <% :session_end -> %>
-              <div class="flex items-center gap-3 py-2">
-                <div class="flex-1 h-px bg-gray-600"></div>
-                <span class={"text-xs font-medium px-2 #{session_end_color(msg.content)}"}>
-                  Session {session_end_text(msg.content)}
-                </span>
-                <div class="flex-1 h-px bg-gray-600"></div>
-              </div>
-
-            <% :tool_call -> %>
-              <div class="border border-gray-700 rounded-lg overflow-hidden">
-                <button
-                  phx-click="toggle_tool"
-                  phx-value-id={msg.id}
-                  class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
-                >
-                  <span class="text-gray-500 transition-transform duration-200" style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}>
-                    ▶
-                  </span>
-                  <span class="text-yellow-400 font-medium">{msg.name}</span>
-                  <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
-                  <%= if msg.is_error do %>
-                    <span class="text-red-400 text-xs">error</span>
-                  <% end %>
-                </button>
-                <div class={"px-3 py-2 bg-gray-900 border-t border-gray-700 #{if msg.collapsed, do: "hidden", else: ""}"}>
-                  <div class="text-xs text-gray-500 mb-1">Input</div>
-                  <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">{msg.input}</div>
-                  <%= if msg.output do %>
-                    <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
-                    <div class={"whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto #{if msg.is_error, do: "text-red-400", else: "text-gray-300"}"}>{msg.output}</div>
-                  <% else %>
-                    <div class="text-xs text-gray-500 italic">Running...</div>
-                  <% end %>
-                </div>
-              </div>
-
-            <% :assistant -> %>
-              <div class={message_class(:assistant)}>
-                <div class="text-xs text-gray-500 mb-1">assistant</div>
-                <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
-              </div>
-
-            <% _ -> %>
-              <div class={message_class(msg.type)}>
-                <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
-                <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
-              </div>
-          <% end %>
-        <% end %>
-      </div>
-      
+        
     <!-- Input -->
-      <div class="flex-none p-4 border-t border-gray-700">
-        <form phx-submit="send" class="flex gap-2">
-          <input
-            type="text"
-            name="message"
-            value={@input}
-            phx-change="update_input"
-            placeholder={if @status == :ready, do: "Type a message...", else: "Waiting..."}
-            disabled={@status not in [:ready, :processing]}
-            class="flex-1 px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg focus:outline-none focus:border-blue-500 disabled:opacity-50"
-            autocomplete="off"
-          />
-          <button
-            type="submit"
-            disabled={@status not in [:ready, :processing] or @input == ""}
-            class="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-semibold transition-colors"
-          >
-            Send
-          </button>
-        </form>
+        <div class="flex-none p-4 border-t border-gray-700">
+          <form phx-submit="send" class="flex gap-2">
+            <input
+              type="text"
+              name="message"
+              value={@input}
+              phx-change="update_input"
+              placeholder={if @status == :ready, do: "Type a message...", else: "Waiting..."}
+              disabled={@status not in [:ready, :processing]}
+              class="flex-1 px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg focus:outline-none focus:border-blue-500 disabled:opacity-50"
+              autocomplete="off"
+            />
+            <button
+              type="submit"
+              disabled={@status not in [:ready, :processing] or @input == ""}
+              class="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-semibold transition-colors"
+            >
+              Send
+            </button>
+          </form>
+        </div>
       </div>
-    </div>
+    </Layouts.full_screen>
     """
   end
 
   # Helper functions
-
-  defp toggle_tool_message(messages, id) do
-    Enum.map(messages, fn msg ->
-      if msg.id == id && msg.type == :tool_call, do: %{msg | collapsed: !msg.collapsed}, else: msg
-    end)
-  end
-
-  defp apply_tool_result(messages, result) do
-    Enum.map(messages, &update_tool_message(&1, result))
-  end
-
-  defp update_tool_message(%{type: :tool_call, tool_use_id: id} = msg, %{tool_use_id: id} = result) do
-    output = extract_tool_output(result)
-    %{msg | output: output, is_error: result.is_error}
-  end
-
-  defp update_tool_message(msg, _result), do: msg
 
   defp extract_tool_output(%{stderr: stderr}) when stderr != "", do: stderr
   defp extract_tool_output(%{stdout: stdout}) when stdout != "", do: stdout
@@ -410,24 +441,23 @@ defmodule MiniMeWeb.SessionLive do
       })
 
     message = Chat.Message.to_display(db_message)
-    update(socket, :messages, fn messages -> messages ++ [message] end)
+    stream_insert(socket, :messages, message)
   end
 
   defp append_to_assistant_message(socket, text) do
-    messages = socket.assigns.messages
     streaming_id = socket.assigns.streaming_message_id
+    streaming_msg = socket.assigns.streaming_message
 
-    last_msg = List.last(messages)
-
-    if streaming_id && last_msg && last_msg.type == :assistant && last_msg.id == streaming_id do
+    if streaming_id && streaming_msg && streaming_msg.type == :assistant do
       # Append to existing streaming message
-      updated_msg = %{last_msg | content: (last_msg.content || "") <> text}
-      updated_messages = List.replace_at(messages, -1, updated_msg)
+      updated_msg = %{streaming_msg | content: (streaming_msg.content || "") <> text}
 
       # Persist the appended content
       Chat.append_to_message(streaming_id, text)
 
-      assign(socket, :messages, updated_messages)
+      socket
+      |> assign(:streaming_message, updated_msg)
+      |> stream_insert(:messages, updated_msg)
     else
       # Create a new assistant message
       workspace_id = socket.assigns.workspace.id
@@ -445,7 +475,8 @@ defmodule MiniMeWeb.SessionLive do
 
       socket
       |> assign(:streaming_message_id, db_message.id)
-      |> update(:messages, fn msgs -> msgs ++ [message] end)
+      |> assign(:streaming_message, message)
+      |> stream_insert(:messages, message)
     end
   end
 
@@ -462,6 +493,7 @@ defmodule MiniMeWeb.SessionLive do
   defp status_color(:starting_claude), do: "text-blue-400"
   defp status_color(:error), do: "text-red-400"
   defp status_color(:disconnected), do: "text-orange-400"
+  defp status_color(:idle), do: "text-gray-400"
   defp status_color(_), do: "text-gray-400"
 
   defp status_text(:ready), do: "Ready"
@@ -472,6 +504,7 @@ defmodule MiniMeWeb.SessionLive do
   defp status_text(:error), do: "Error"
   defp status_text(:disconnected), do: "Disconnected"
   defp status_text(:initializing), do: "Initializing..."
+  defp status_text(:idle), do: "Idle (sprite sleeping)"
   defp status_text(status), do: to_string(status)
 
   defp session_end_color("completed"), do: "text-green-500"

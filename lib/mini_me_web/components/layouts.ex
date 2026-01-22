@@ -151,4 +151,27 @@ defmodule MiniMeWeb.Layouts do
     </div>
     """
   end
+
+  @doc """
+  Minimal full-screen layout for custom UIs.
+
+  Provides flash message handling without the standard navbar/header.
+  Use this for full-screen applications that need custom layouts.
+
+  ## Examples
+
+      <Layouts.full_screen flash={@flash}>
+        <div class="min-h-screen">Content</div>
+      </Layouts.full_screen>
+
+  """
+  attr :flash, :map, required: true, doc: "the map of flash messages"
+  slot :inner_block, required: true
+
+  def full_screen(assigns) do
+    ~H"""
+    {render_slot(@inner_block)}
+    <.flash_group flash={@flash} />
+    """
+  end
 end

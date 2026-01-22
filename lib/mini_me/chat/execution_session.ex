@@ -40,7 +40,8 @@ defmodule MiniMe.Chat.ExecutionSession do
     })
   end
 
-  def complete_changeset(session, status \\ "completed") when status in ["completed", "failed", "interrupted"] do
+  def complete_changeset(session, status \\ "completed")
+      when status in ["completed", "failed", "interrupted"] do
     changeset(session, %{
       status: status,
       ended_at: DateTime.utc_now()

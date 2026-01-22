@@ -42,6 +42,27 @@ defmodule MiniMe.Sandbox.Client do
   end
 
   @doc """
+  List all sprites for the current account.
+  Returns a list of sprite objects with name, status, etc.
+  """
+  def list_sprites do
+    case request(:get, "/sprites") do
+      {:ok, %{status: 200, body: %{"sprites" => sprites}}} ->
+        {:ok, sprites}
+
+      {:ok, %{status: 200, body: sprites}} when is_list(sprites) ->
+        # Fallback in case API returns plain list
+        {:ok, sprites}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {status, body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
   Get sprite details.
   """
   def get_sprite(name) do
@@ -51,6 +72,23 @@ defmodule MiniMe.Sandbox.Client do
 
       {:ok, %{status: 404}} ->
         {:error, :not_found}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {status, body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Suspend (hibernate) a sprite. This stops compute charges.
+  The sprite will wake automatically on next request.
+  """
+  def suspend_sprite(name) do
+    case request(:post, "/sprites/#{name}/suspend", %{}) do
+      {:ok, %{status: 200}} ->
+        :ok
 
       {:ok, %{status: status, body: body}} ->
         {:error, {status, body}}
@@ -279,7 +317,9 @@ defmodule MiniMe.Sandbox.Client do
       [
         method: method,
         url: base_url <> path,
-        headers: [{"authorization", "Bearer #{token()}"}]
+        headers: [{"authorization", "Bearer #{token()}"}],
+        # Suppress noisy retry warnings for transient connection issues
+        retry_log_level: false
       ]
       |> maybe_add_json(body)
       |> Keyword.merge(opts)

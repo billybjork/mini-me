@@ -82,10 +82,13 @@ defmodule MiniMe.Workspaces do
   end
 
   @doc """
-  Delete a workspace.
+  Delete a workspace. Returns :ok even if already deleted (idempotent).
   """
   def delete_workspace(workspace) do
-    Repo.delete(workspace)
+    case Repo.delete(workspace, allow_stale: true) do
+      {:ok, _} -> :ok
+      {:error, _} -> :ok
+    end
   end
 
   # Private Functions

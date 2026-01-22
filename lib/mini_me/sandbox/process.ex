@@ -86,6 +86,13 @@ defmodule MiniMe.Sandbox.Process do
   end
 
   @impl true
+  def handle_disconnect(%{reason: %WebSockex.RequestError{code: 404}} = disconnect_map, state) do
+    # Sprite doesn't exist - don't reconnect
+    Logger.warning("Sprite not found (404), stopping: #{inspect(disconnect_map)}")
+    send(state.session_pid, {:agent_status, :disconnected})
+    {:ok, state}
+  end
+
   def handle_disconnect(disconnect_map, state) do
     Logger.warning("Disconnected from Sprite: #{inspect(disconnect_map)}")
     send(state.session_pid, {:agent_status, :disconnected})
@@ -95,6 +102,12 @@ defmodule MiniMe.Sandbox.Process do
   @impl true
   def terminate(reason, state) do
     Logger.info("Sprite process terminating: #{inspect(reason)}")
+
+    # Kill the Claude process on the sprite to allow it to hibernate
+    Task.start(fn ->
+      Client.exec(state.sprite_name, "pkill -f 'claude --print' || true", timeout: 5_000)
+    end)
+
     send(state.session_pid, {:agent_status, {:terminated, reason}})
   end
 
@@ -228,8 +241,25 @@ defmodule MiniMe.Sandbox.Process do
   defp normalize_event("result", event),
     do: %{type: :message_stop, data: event}
 
-  defp normalize_event(type, event),
-    do: %{type: String.to_atom(type), data: event}
+  # Known event types from Claude Code streaming output
+  @known_event_types %{
+    "system" => :system,
+    "assistant" => :assistant,
+    "user" => :user,
+    "result" => :result,
+    "error" => :error,
+    "content_block_start" => :content_block_start,
+    "content_block_delta" => :content_block_delta,
+    "content_block_stop" => :content_block_stop,
+    "message_start" => :message_start,
+    "message_delta" => :message_delta,
+    "message_stop" => :message_stop
+  }
+
+  defp normalize_event(type, event) do
+    atom_type = Map.get(@known_event_types, type, :unknown)
+    %{type: atom_type, data: event, original_type: type}
+  end
 
   # Extract output from tool results which can come in various formats
   defp extract_tool_output(result) when is_binary(result) do
@@ -266,6 +296,7 @@ defmodule MiniMe.Sandbox.Process do
 
   # Normalize content which might be a string or array of content blocks
   defp normalize_content(content) when is_binary(content), do: content
+
   defp normalize_content(content) when is_list(content) do
     Enum.map_join(content, "", fn
       %{"type" => "text", "text" => text} -> text
@@ -274,9 +305,11 @@ defmodule MiniMe.Sandbox.Process do
       item -> inspect(item)
     end)
   end
+
   defp normalize_content(content) when is_map(content) do
     Map.get(content, "text", inspect(content))
   end
+
   defp normalize_content(nil), do: ""
   defp normalize_content(content), do: inspect(content)
 

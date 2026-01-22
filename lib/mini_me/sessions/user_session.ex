@@ -18,11 +18,14 @@ defmodule MiniMe.Sessions.UserSession do
   alias MiniMe.Chat
 
   @pubsub MiniMe.PubSub
+  # Idle timeout before stopping Claude to let sprite sleep (2 minutes)
+  @idle_timeout :timer.minutes(2)
 
   defstruct [
     :workspace,
     :process_pid,
     :execution_session_id,
+    :idle_timer,
     status: :initializing,
     message_queue: :queue.new()
   ]
@@ -100,9 +103,16 @@ defmodule MiniMe.Sessions.UserSession do
 
   @impl true
   def handle_cast({:send_message, text}, state) do
-    Logger.debug("UserSession.send_message: status=#{state.status}, process_pid=#{inspect(state.process_pid)}, queue_len=#{:queue.len(state.message_queue)}")
+    Logger.debug(
+      "UserSession.send_message: status=#{state.status}, process_pid=#{inspect(state.process_pid)}, queue_len=#{:queue.len(state.message_queue)}"
+    )
+
     state = handle_user_message(text, state)
-    Logger.debug("UserSession.send_message after handle: status=#{state.status}, process_pid=#{inspect(state.process_pid)}")
+
+    Logger.debug(
+      "UserSession.send_message after handle: status=#{state.status}, process_pid=#{inspect(state.process_pid)}"
+    )
+
     {:noreply, state}
   end
 
@@ -213,6 +223,18 @@ defmodule MiniMe.Sessions.UserSession do
     # Don't nil process_pid - the WebSockex (Sandbox.Process) is still alive
     # and will reconnect, restarting Claude Code
     {:noreply, %{state | status: :exited, execution_session_id: nil}}
+  end
+
+  def handle_info(:idle_timeout, state) do
+    Logger.info("Idle timeout - stopping Claude to let sprite sleep")
+
+    # Stop the Sandbox.Process (which will kill Claude)
+    if state.process_pid && Elixir.Process.alive?(state.process_pid) do
+      GenServer.stop(state.process_pid, :normal)
+    end
+
+    broadcast(state, {:session_status, :idle})
+    {:noreply, %{state | status: :idle, process_pid: nil, idle_timer: nil}}
   end
 
   def handle_info(msg, state) do
@@ -357,6 +379,9 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   defp handle_user_message(text, state) do
+    # Cancel idle timer on any user activity
+    state = cancel_idle_timer(state)
+
     case state.status do
       :ready ->
         dispatch_message(text, state)
@@ -364,7 +389,7 @@ defmodule MiniMe.Sessions.UserSession do
       :processing ->
         queue_message(text, state)
 
-      status when status in [:disconnected, :exited] ->
+      status when status in [:disconnected, :exited, :idle] ->
         # Queue message and restart Claude Code to wake the sprite
         state = queue_message(text, state)
         Logger.info("Session #{status}, restarting Claude Code for queued message")
@@ -436,7 +461,12 @@ defmodule MiniMe.Sessions.UserSession do
   defp handle_agent_event(%{type: :message_stop}, state) do
     broadcast(state, {:agent_done})
     broadcast(state, {:session_status, :ready})
-    process_queued_messages(%{state | status: :ready})
+
+    # Start idle timer - will stop Claude if no activity
+    state = cancel_idle_timer(state)
+    timer = Elixir.Process.send_after(self(), :idle_timeout, @idle_timeout)
+
+    process_queued_messages(%{state | status: :ready, idle_timer: timer})
   end
 
   defp handle_agent_event(event, state) do
@@ -446,5 +476,12 @@ defmodule MiniMe.Sessions.UserSession do
 
   defp broadcast(state, message) do
     Phoenix.PubSub.broadcast(@pubsub, pubsub_topic(state.workspace.id), message)
+  end
+
+  defp cancel_idle_timer(%{idle_timer: nil} = state), do: state
+
+  defp cancel_idle_timer(%{idle_timer: timer} = state) do
+    Elixir.Process.cancel_timer(timer)
+    %{state | idle_timer: nil}
   end
 end
