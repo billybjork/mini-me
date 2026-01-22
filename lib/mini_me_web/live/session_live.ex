@@ -108,9 +108,6 @@ defmodule MiniMeWeb.SessionLive do
         :connecting ->
           add_message(socket, :system, "Connecting to sandbox...")
 
-        :cloning ->
-          add_message(socket, :system, "Cloning repository...")
-
         :starting_claude ->
           add_message(socket, :system, "Starting Claude Code...")
 
@@ -489,7 +486,6 @@ defmodule MiniMeWeb.SessionLive do
   defp status_color(:ready), do: "text-green-400"
   defp status_color(:processing), do: "text-yellow-400"
   defp status_color(:connecting), do: "text-blue-400"
-  defp status_color(:cloning), do: "text-blue-400"
   defp status_color(:starting_claude), do: "text-blue-400"
   defp status_color(:error), do: "text-red-400"
   defp status_color(:disconnected), do: "text-orange-400"
@@ -499,7 +495,6 @@ defmodule MiniMeWeb.SessionLive do
   defp status_text(:ready), do: "Ready"
   defp status_text(:processing), do: "Processing..."
   defp status_text(:connecting), do: "Connecting..."
-  defp status_text(:cloning), do: "Cloning repo..."
   defp status_text(:starting_claude), do: "Starting Claude..."
   defp status_text(:error), do: "Error"
   defp status_text(:disconnected), do: "Disconnected"
