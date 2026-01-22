@@ -13,8 +13,10 @@ defmodule MiniMe.Repos.Repo do
     field :github_name, :string
     field :default_branch, :string, default: "main"
     field :last_used_at, :utc_datetime
+    field :locked_at, :utc_datetime
 
     has_many :tasks, MiniMe.Tasks.Task
+    belongs_to :locked_by_task, MiniMe.Tasks.Task
 
     timestamps(type: :utc_datetime)
   end

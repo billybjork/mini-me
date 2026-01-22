@@ -35,6 +35,7 @@ defmodule MiniMe.Tasks.Task do
     |> cast(attrs, [:title, :status, :repo_id])
     |> validate_inclusion(:status, @statuses)
     |> foreign_key_constraint(:repo_id)
+    |> assoc_constraint(:repo)
   end
 
   @doc """
