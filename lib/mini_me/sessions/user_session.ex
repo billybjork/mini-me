@@ -15,12 +15,14 @@ defmodule MiniMe.Sessions.UserSession do
   alias MiniMe.Sessions.Registry
   alias MiniMe.Workspaces
   alias MiniMe.Transform.Pipeline
+  alias MiniMe.Chat
 
   @pubsub MiniMe.PubSub
 
   defstruct [
     :workspace,
     :process_pid,
+    :execution_session_id,
     status: :initializing,
     message_queue: :queue.new()
   ]
@@ -56,6 +58,13 @@ defmodule MiniMe.Sessions.UserSession do
   end
 
   @doc """
+  Get the current execution session ID (for message persistence).
+  """
+  def execution_session_id(pid) do
+    GenServer.call(pid, :execution_session_id)
+  end
+
+  @doc """
   Get the PubSub topic for a workspace.
   """
   def pubsub_topic(workspace_id) do
@@ -82,6 +91,11 @@ defmodule MiniMe.Sessions.UserSession do
   @impl true
   def handle_call(:status, _from, state) do
     {:reply, %{status: state.status, queued: :queue.len(state.message_queue)}, state}
+  end
+
+  def handle_call(:execution_session_id, _from, state) do
+    # Use Map.get for backwards compatibility with old processes
+    {:reply, Map.get(state, :execution_session_id), state}
   end
 
   @impl true
@@ -133,8 +147,14 @@ defmodule MiniMe.Sessions.UserSession do
   def handle_info({:agent_status, :connected}, state) do
     Logger.info("Claude Code connected for workspace #{state.workspace.id}")
     Workspaces.update_status(state.workspace, "ready")
+
+    # Start a new execution session
+    {:ok, session} = Chat.start_execution_session(state.workspace.id, "claude_code")
+    broadcast(state, {:execution_session_started, session.id})
     broadcast(state, {:session_status, :ready})
-    state = process_queued_messages(%{state | status: :ready})
+
+    state = %{state | status: :ready, execution_session_id: session.id}
+    state = process_queued_messages(state)
     {:noreply, state}
   end
 
@@ -146,6 +166,13 @@ defmodule MiniMe.Sessions.UserSession do
 
   def handle_info({:agent_status, {:terminated, reason}}, state) do
     Logger.info("Claude Code terminated: #{inspect(reason)}")
+
+    # Complete the execution session as interrupted
+    if state.execution_session_id do
+      Chat.complete_execution_session(state.execution_session_id, "interrupted")
+      broadcast(state, {:execution_session_ended, state.execution_session_id, "interrupted"})
+    end
+
     broadcast(state, {:agent_error, "Session ended"})
     {:stop, :normal, state}
   end
@@ -174,10 +201,18 @@ defmodule MiniMe.Sessions.UserSession do
 
   def handle_info({:agent_exit, code}, state) do
     Logger.info("Claude Code exited with code #{code}")
+
+    # Complete the execution session
+    if state.execution_session_id do
+      status = if code == 0, do: "completed", else: "failed"
+      Chat.complete_execution_session(state.execution_session_id, status)
+      broadcast(state, {:execution_session_ended, state.execution_session_id, status})
+    end
+
     broadcast(state, {:agent_done})
     # Don't nil process_pid - the WebSockex (Sandbox.Process) is still alive
     # and will reconnect, restarting Claude Code
-    {:noreply, %{state | status: :exited}}
+    {:noreply, %{state | status: :exited, execution_session_id: nil}}
   end
 
   def handle_info(msg, state) do
@@ -283,7 +318,8 @@ defmodule MiniMe.Sessions.UserSession do
     case Process.start_link(
            sprite_name: state.workspace.sprite_name,
            session_pid: self(),
-           working_dir: state.workspace.working_dir
+           working_dir: state.workspace.working_dir,
+           repo_name: state.workspace.github_repo_name
          ) do
       {:ok, pid} ->
         {:noreply, %{state | process_pid: pid, status: :connecting}}
@@ -307,7 +343,8 @@ defmodule MiniMe.Sessions.UserSession do
     case Process.start_link(
            sprite_name: state.workspace.sprite_name,
            session_pid: self(),
-           working_dir: state.workspace.working_dir
+           working_dir: state.workspace.working_dir,
+           repo_name: state.workspace.github_repo_name
          ) do
       {:ok, pid} ->
         %{state | process_pid: pid, status: :connecting}

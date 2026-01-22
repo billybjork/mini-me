@@ -22,8 +22,9 @@ defmodule MiniMe.Sandbox.Process do
     sprite_name = Keyword.fetch!(opts, :sprite_name)
     session_pid = Keyword.fetch!(opts, :session_pid)
     working_dir = Keyword.get(opts, :working_dir, "/home/sprite")
+    repo_name = Keyword.get(opts, :repo_name)
 
-    cmd = build_claude_command(working_dir)
+    cmd = build_claude_command(working_dir, repo_name)
     url = Client.exec_websocket_url(sprite_name, cmd, tty: false, stdin: true)
 
     state = %__MODULE__{
@@ -99,7 +100,7 @@ defmodule MiniMe.Sandbox.Process do
 
   # Private Functions
 
-  defp build_claude_command(working_dir) do
+  defp build_claude_command(working_dir, repo_name) do
     oauth_token = Application.get_env(:mini_me, :claude_oauth_token)
 
     env_prefix =
@@ -109,7 +110,16 @@ defmodule MiniMe.Sandbox.Process do
         ""
       end
 
-    "cd #{working_dir} && #{env_prefix}claude --print --input-format stream-json --output-format stream-json --verbose"
+    # Provide context about the workspace via system prompt
+    context_prompt =
+      if repo_name do
+        escaped = String.replace(repo_name, "'", "'\\''")
+        " --append-system-prompt 'You are working in the #{escaped} repository.'"
+      else
+        ""
+      end
+
+    "cd #{working_dir} && #{env_prefix}claude --print --input-format stream-json --output-format stream-json --verbose#{context_prompt}"
   end
 
   defp handle_stdout(payload, state) do

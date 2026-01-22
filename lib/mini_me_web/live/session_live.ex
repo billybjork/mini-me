@@ -6,19 +6,25 @@ defmodule MiniMeWeb.SessionLive do
 
   alias MiniMe.Workspaces
   alias MiniMe.Sessions.{Registry, UserSession}
+  alias MiniMe.Chat
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do
     workspace = Workspaces.get_workspace!(id)
 
+    # Load persisted messages
+    messages = Chat.list_messages_for_display(workspace.id)
+
     socket =
       socket
       |> assign(:workspace, workspace)
-      |> assign(:messages, [])
+      |> assign(:messages, messages)
       |> assign(:status, :initializing)
       |> assign(:current_tool, nil)
       |> assign(:input, "")
       |> assign(:session_pid, nil)
+      |> assign(:execution_session_id, nil)
+      |> assign(:streaming_message_id, nil)
 
     if connected?(socket) do
       # Subscribe to session events
@@ -40,7 +46,14 @@ defmodule MiniMeWeb.SessionLive do
         # Session exists, monitor it and get its status
         Process.monitor(pid)
         status = UserSession.status(pid)
-        {:noreply, assign(socket, session_pid: pid, status: status.status)}
+        exec_session_id = UserSession.execution_session_id(pid)
+
+        {:noreply,
+         assign(socket,
+           session_pid: pid,
+           status: status.status,
+           execution_session_id: exec_session_id
+         )}
 
       :error ->
         # Start new session
@@ -116,17 +129,26 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   def handle_info({:tool_use, tool}, socket) do
-    message = %{
-      id: System.unique_integer([:positive]),
-      type: :tool_call,
-      tool_use_id: tool.id,
-      name: tool.name,
-      input: format_tool_input(tool.name, tool.input),
-      output: nil,
-      is_error: false,
-      collapsed: true,
-      timestamp: DateTime.utc_now()
-    }
+    workspace_id = socket.assigns.workspace.id
+    execution_session_id = socket.assigns.execution_session_id
+    formatted_input = format_tool_input(tool.name, tool.input)
+
+    # Persist to database
+    {:ok, db_message} =
+      Chat.create_message(%{
+        workspace_id: workspace_id,
+        execution_session_id: execution_session_id,
+        type: "tool_call",
+        tool_data: %{
+          "tool_use_id" => tool.id,
+          "name" => tool.name,
+          "input" => formatted_input,
+          "output" => nil,
+          "is_error" => false
+        }
+      })
+
+    message = Chat.Message.to_display(db_message)
 
     socket =
       socket
@@ -137,12 +159,22 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   def handle_info({:tool_result, result}, socket) do
+    # Update in-memory messages
     socket = update(socket, :messages, &apply_tool_result(&1, result))
+
+    # Persist tool result to database
+    workspace_id = socket.assigns.workspace.id
+    output = extract_tool_output(result)
+
+    if tool_msg = Chat.find_tool_message(workspace_id, result.tool_use_id) do
+      Chat.update_tool_result(tool_msg.id, output, result.is_error)
+    end
+
     {:noreply, push_event(socket, "scroll_bottom", %{})}
   end
 
   def handle_info({:agent_done}, socket) do
-    {:noreply, assign(socket, :current_tool, nil)}
+    {:noreply, assign(socket, current_tool: nil, streaming_message_id: nil)}
   end
 
   def handle_info({:agent_error, reason}, socket) do
@@ -150,6 +182,24 @@ defmodule MiniMeWeb.SessionLive do
       socket
       |> assign(:status, :error)
       |> add_message(:error, reason)
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:execution_session_started, session_id}, socket) do
+    socket =
+      socket
+      |> assign(:execution_session_id, session_id)
+      |> add_message(:session_start, nil)
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:execution_session_ended, _session_id, status}, socket) do
+    socket =
+      socket
+      |> assign(:execution_session_id, nil)
+      |> add_message(:session_end, status)
 
     {:noreply, socket}
   end
@@ -237,42 +287,62 @@ defmodule MiniMeWeb.SessionLive do
     <!-- Messages -->
       <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messages">
         <%= for msg <- @messages do %>
-          <%= if msg.type == :tool_call do %>
-            <div class="border border-gray-700 rounded-lg overflow-hidden">
-              <button
-                phx-click="toggle_tool"
-                phx-value-id={msg.id}
-                class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
-              >
-                <span class="text-gray-500 transition-transform duration-200" style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}>
-                  ▶
-                </span>
-                <span class="text-yellow-400 font-medium">{msg.name}</span>
-                <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
-                <%= if msg.is_error do %>
-                  <span class="text-red-400 text-xs">error</span>
-                <% end %>
-              </button>
-              <div class={"px-3 py-2 bg-gray-900 border-t border-gray-700 #{if msg.collapsed, do: "hidden", else: ""}"}>
-                <div class="text-xs text-gray-500 mb-1">Input</div>
-                <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">{msg.input}</div>
-                <%= if msg.output do %>
-                  <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
-                  <div class={"whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto #{if msg.is_error, do: "text-red-400", else: "text-gray-300"}"}>{msg.output}</div>
-                <% else %>
-                  <div class="text-xs text-gray-500 italic">Running...</div>
-                <% end %>
+          <%= case msg.type do %>
+            <% :session_start -> %>
+              <div class="flex items-center gap-3 py-2">
+                <div class="flex-1 h-px bg-green-700"></div>
+                <span class="text-xs text-green-500 font-medium px-2">Claude Code Session Started</span>
+                <div class="flex-1 h-px bg-green-700"></div>
               </div>
-            </div>
-          <% else %>
-            <div class={message_class(msg.type)}>
-              <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
-              <%= if msg.type == :assistant do %>
+
+            <% :session_end -> %>
+              <div class="flex items-center gap-3 py-2">
+                <div class="flex-1 h-px bg-gray-600"></div>
+                <span class={"text-xs font-medium px-2 #{session_end_color(msg.content)}"}>
+                  Session {session_end_text(msg.content)}
+                </span>
+                <div class="flex-1 h-px bg-gray-600"></div>
+              </div>
+
+            <% :tool_call -> %>
+              <div class="border border-gray-700 rounded-lg overflow-hidden">
+                <button
+                  phx-click="toggle_tool"
+                  phx-value-id={msg.id}
+                  class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-750 text-left text-sm"
+                >
+                  <span class="text-gray-500 transition-transform duration-200" style={if msg.collapsed, do: "", else: "transform: rotate(90deg)"}>
+                    ▶
+                  </span>
+                  <span class="text-yellow-400 font-medium">{msg.name}</span>
+                  <span class="text-gray-400 truncate flex-1 font-mono text-xs">{msg.input}</span>
+                  <%= if msg.is_error do %>
+                    <span class="text-red-400 text-xs">error</span>
+                  <% end %>
+                </button>
+                <div class={"px-3 py-2 bg-gray-900 border-t border-gray-700 #{if msg.collapsed, do: "hidden", else: ""}"}>
+                  <div class="text-xs text-gray-500 mb-1">Input</div>
+                  <div class="whitespace-pre-wrap font-mono text-xs text-gray-300 mb-2">{msg.input}</div>
+                  <%= if msg.output do %>
+                    <div class="text-xs text-gray-500 mb-1 mt-2">Output</div>
+                    <div class={"whitespace-pre-wrap font-mono text-xs max-h-64 overflow-y-auto #{if msg.is_error, do: "text-red-400", else: "text-gray-300"}"}>{msg.output}</div>
+                  <% else %>
+                    <div class="text-xs text-gray-500 italic">Running...</div>
+                  <% end %>
+                </div>
+              </div>
+
+            <% :assistant -> %>
+              <div class={message_class(:assistant)}>
+                <div class="text-xs text-gray-500 mb-1">assistant</div>
                 <div class="markdown-content text-sm">{raw(render_markdown(msg.content))}</div>
-              <% else %>
+              </div>
+
+            <% _ -> %>
+              <div class={message_class(msg.type)}>
+                <div class="text-xs text-gray-500 mb-1">{msg.type}</div>
                 <div class="whitespace-pre-wrap font-mono text-sm">{msg.content}</div>
-              <% end %>
-            </div>
+              </div>
           <% end %>
         <% end %>
       </div>
@@ -327,27 +397,55 @@ defmodule MiniMeWeb.SessionLive do
   defp extract_tool_output(_result), do: "(no output)"
 
   defp add_message(socket, type, content) do
-    message = %{
-      id: System.unique_integer([:positive]),
-      type: type,
-      content: content,
-      timestamp: DateTime.utc_now()
-    }
+    workspace_id = socket.assigns.workspace.id
+    execution_session_id = socket.assigns.execution_session_id
 
+    # Persist to database
+    {:ok, db_message} =
+      Chat.create_message(%{
+        workspace_id: workspace_id,
+        execution_session_id: execution_session_id,
+        type: to_string(type),
+        content: content
+      })
+
+    message = Chat.Message.to_display(db_message)
     update(socket, :messages, fn messages -> messages ++ [message] end)
   end
 
   defp append_to_assistant_message(socket, text) do
     messages = socket.assigns.messages
+    streaming_id = socket.assigns.streaming_message_id
 
-    case List.last(messages) do
-      %{type: :assistant} = last_msg ->
-        updated_msg = %{last_msg | content: last_msg.content <> text}
-        updated_messages = List.replace_at(messages, -1, updated_msg)
-        assign(socket, :messages, updated_messages)
+    last_msg = List.last(messages)
 
-      _ ->
-        add_message(socket, :assistant, text)
+    if streaming_id && last_msg && last_msg.type == :assistant && last_msg.id == streaming_id do
+      # Append to existing streaming message
+      updated_msg = %{last_msg | content: (last_msg.content || "") <> text}
+      updated_messages = List.replace_at(messages, -1, updated_msg)
+
+      # Persist the appended content
+      Chat.append_to_message(streaming_id, text)
+
+      assign(socket, :messages, updated_messages)
+    else
+      # Create a new assistant message
+      workspace_id = socket.assigns.workspace.id
+      execution_session_id = socket.assigns.execution_session_id
+
+      {:ok, db_message} =
+        Chat.create_message(%{
+          workspace_id: workspace_id,
+          execution_session_id: execution_session_id,
+          type: "assistant",
+          content: text
+        })
+
+      message = Chat.Message.to_display(db_message)
+
+      socket
+      |> assign(:streaming_message_id, db_message.id)
+      |> update(:messages, fn msgs -> msgs ++ [message] end)
     end
   end
 
@@ -375,6 +473,16 @@ defmodule MiniMeWeb.SessionLive do
   defp status_text(:disconnected), do: "Disconnected"
   defp status_text(:initializing), do: "Initializing..."
   defp status_text(status), do: to_string(status)
+
+  defp session_end_color("completed"), do: "text-green-500"
+  defp session_end_color("failed"), do: "text-red-500"
+  defp session_end_color("interrupted"), do: "text-orange-500"
+  defp session_end_color(_), do: "text-gray-500"
+
+  defp session_end_text("completed"), do: "Completed"
+  defp session_end_text("failed"), do: "Failed"
+  defp session_end_text("interrupted"), do: "Interrupted"
+  defp session_end_text(_), do: "Ended"
 
   defp format_tool_input("Bash", %{"command" => cmd}), do: cmd
   defp format_tool_input("Read", %{"file_path" => path}), do: path

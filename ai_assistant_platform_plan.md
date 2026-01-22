@@ -99,7 +99,11 @@ This separation of concerns (brain vs. hands) matches proven orchestrator-worker
 ```
 User
  ├── Workspace (1:1) ──── Sprite (1:1)
- │                         └── Checkpoints
+ │    │                    └── Checkpoints
+ │    ├── Messages (1:many)
+ │    └── ExecutionSessions (1:many)
+ │         └── Messages (1:many, optional)
+ │
  ├── Tasks (1:many)
  │    └── Jobs (1:many) ── within sprite
  ├── Credentials (1:many)
@@ -113,6 +117,8 @@ User
 |--------|---------|------------|
 | **User** | Account & auth | email, tier, status |
 | **Workspace** | User's sprite config | sprite_id, storage_used, config |
+| **Message** | Chat message in conversation | workspace_id, execution_session_id, type, content, tool_data |
+| **ExecutionSession** | Agent execution boundary | workspace_id, session_type, status, started_at, ended_at |
 | **Task** | User request (outer loop) | input, status, routing_decision, result, artifacts |
 | **Job** | Execution instance (inner loop) | task_id, working_dir, pid, status, output_log |
 | **Checkpoint** | Sprite state snapshot | sprite_checkpoint_id, label, created_at |
@@ -122,6 +128,8 @@ User
 | **Tool** | Atomic capability | executable, install_command, permissions |
 | **Skill** | Prompt + tools bundle | prompt_template, required_tools |
 | **App** | Pre-packaged environment | setup_script, launch_command, port |
+
+**Message & ExecutionSession**: Messages are persisted chat records (user, assistant, system, tool_call, error). An ExecutionSession tracks when an agent (e.g., Claude Code) has active context—messages within a session share that agent's memory. When a session ends (completed/failed/interrupted), subsequent messages start fresh. Messages can exist without a session (general chat) or within one (agent execution). This distinction is surfaced in the UI with visual session boundaries.
 
 **Task vs Job**: A Task is the user-facing request managed by the outer loop. A Job is a single execution instance in the sprite. One task can spawn multiple jobs on retry (failed job → new job, same task) or if we later support parallel subtask decomposition. For MVP, most tasks have a single job.
 
