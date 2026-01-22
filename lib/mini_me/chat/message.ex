@@ -1,6 +1,6 @@
 defmodule MiniMe.Chat.Message do
   @moduledoc """
-  A chat message in a workspace conversation.
+  A chat message in a task conversation.
 
   Messages can optionally belong to an execution session, which groups them
   within a bounded agent context (e.g., a Claude Code session).
@@ -15,7 +15,7 @@ defmodule MiniMe.Chat.Message do
     field :content, :string
     field :tool_data, :map
 
-    belongs_to :workspace, MiniMe.Workspaces.Workspace
+    belongs_to :task, MiniMe.Tasks.Task
     belongs_to :execution_session, MiniMe.Chat.ExecutionSession
 
     timestamps()
@@ -23,15 +23,15 @@ defmodule MiniMe.Chat.Message do
 
   def changeset(message, attrs) do
     message
-    |> cast(attrs, [:workspace_id, :execution_session_id, :type, :content, :tool_data])
-    |> validate_required([:workspace_id, :type])
+    |> cast(attrs, [:task_id, :execution_session_id, :type, :content, :tool_data])
+    |> validate_required([:task_id, :type])
     |> validate_inclusion(:type, @types)
-    |> foreign_key_constraint(:workspace_id)
+    |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:execution_session_id)
   end
 
   @doc """
-  Build a message struct for display (matches the in-memory format used by SessionLive).
+  Build a message struct for display (matches the in-memory format used by TaskLive).
   """
   def to_display(%__MODULE__{} = message) do
     base = %{

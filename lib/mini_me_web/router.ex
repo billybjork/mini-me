@@ -32,7 +32,7 @@ defmodule MiniMeWeb.Router do
     pipe_through [:browser, :authenticated]
 
     live "/", HomeLive, :index
-    live "/session/:id", SessionLive, :index
+    live "/tasks/:id", TaskLive, :index
   end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development

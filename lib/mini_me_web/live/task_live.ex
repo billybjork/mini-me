@@ -1,19 +1,19 @@
-defmodule MiniMeWeb.SessionLive do
+defmodule MiniMeWeb.TaskLive do
   @moduledoc """
-  Chat interface LiveView for interacting with Claude Code.
+  LiveView for a single task - chat interface for agent conversations.
   """
   use MiniMeWeb, :live_view
 
-  alias MiniMe.Workspaces
+  alias MiniMe.Tasks
   alias MiniMe.Sessions.{Registry, UserSession}
   alias MiniMe.Chat
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do
-    workspace = Workspaces.get_workspace!(id)
+    task = Tasks.get_task_with_repo!(id)
 
     # Load persisted messages
-    messages = Chat.list_messages_for_display(workspace.id)
+    messages = Chat.list_messages_for_display(task.id)
 
     # Build a map of messages that may need updates (tool_call messages)
     messages_map =
@@ -23,7 +23,7 @@ defmodule MiniMeWeb.SessionLive do
 
     socket =
       socket
-      |> assign(:workspace, workspace)
+      |> assign(:task, task)
       |> stream(:messages, messages)
       |> assign(:messages_map, messages_map)
       |> assign(:status, :initializing)
@@ -36,7 +36,7 @@ defmodule MiniMeWeb.SessionLive do
 
     if connected?(socket) do
       # Subscribe to session events
-      Phoenix.PubSub.subscribe(MiniMe.PubSub, UserSession.pubsub_topic(workspace.id))
+      Phoenix.PubSub.subscribe(MiniMe.PubSub, UserSession.pubsub_topic(task.id))
 
       # Start or find existing session
       send(self(), :ensure_session)
@@ -47,9 +47,9 @@ defmodule MiniMeWeb.SessionLive do
 
   @impl true
   def handle_info(:ensure_session, socket) do
-    workspace = socket.assigns.workspace
+    task = socket.assigns.task
 
-    case Registry.lookup(workspace.id) do
+    case Registry.lookup(task.id) do
       {:ok, pid} ->
         # Session exists, monitor it and get its status
         Process.monitor(pid)
@@ -67,7 +67,7 @@ defmodule MiniMeWeb.SessionLive do
         # Start new session
         case DynamicSupervisor.start_child(
                MiniMe.SessionSupervisor,
-               {UserSession, workspace}
+               {UserSession, task}
              ) do
           {:ok, pid} ->
             Process.monitor(pid)
@@ -108,11 +108,8 @@ defmodule MiniMeWeb.SessionLive do
         :connecting ->
           add_message(socket, :system, "Connecting to sandbox...")
 
-        :cloning ->
-          add_message(socket, :system, "Cloning repository...")
-
-        :starting_claude ->
-          add_message(socket, :system, "Starting Claude Code...")
+        :starting_agent ->
+          add_message(socket, :system, "Starting agent...")
 
         :ready ->
           socket
@@ -137,14 +134,14 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   def handle_info({:tool_use, tool}, socket) do
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     execution_session_id = socket.assigns.execution_session_id
     formatted_input = format_tool_input(tool.name, tool.input)
 
     # Persist to database
     {:ok, db_message} =
       Chat.create_message(%{
-        workspace_id: workspace_id,
+        task_id: task_id,
         execution_session_id: execution_session_id,
         type: "tool_call",
         tool_data: %{
@@ -184,10 +181,10 @@ defmodule MiniMeWeb.SessionLive do
       end)
 
     # Persist tool result to database
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     output = extract_tool_output(result)
 
-    if tool_msg = Chat.find_tool_message(workspace_id, result.tool_use_id) do
+    if tool_msg = Chat.find_tool_message(task_id, result.tool_use_id) do
       Chat.update_tool_result(tool_msg.id, output, result.is_error)
     end
 
@@ -228,7 +225,7 @@ defmodule MiniMeWeb.SessionLive do
 
   def handle_info(msg, socket) do
     require Logger
-    Logger.debug("SessionLive received: #{inspect(msg)}")
+    Logger.debug("TaskLive received: #{inspect(msg)}")
     {:noreply, socket}
   end
 
@@ -237,7 +234,7 @@ defmodule MiniMeWeb.SessionLive do
     require Logger
 
     Logger.debug(
-      "SessionLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
+      "TaskLive.send: session_pid=#{inspect(socket.assigns.session_pid)}, status=#{socket.assigns.status}"
     )
 
     socket =
@@ -248,7 +245,7 @@ defmodule MiniMeWeb.SessionLive do
     if socket.assigns.session_pid do
       UserSession.send_message(socket.assigns.session_pid, message)
     else
-      Logger.warning("SessionLive.send: No session_pid, message dropped!")
+      Logger.warning("TaskLive.send: No session_pid, message dropped!")
     end
 
     {:noreply, push_event(socket, "scroll_bottom", %{})}
@@ -300,7 +297,7 @@ defmodule MiniMeWeb.SessionLive do
         <header class="flex-none p-4 border-b border-gray-700">
           <div class="flex items-center justify-between">
             <div>
-              <h1 class="text-lg font-semibold">{@workspace.github_repo_name}</h1>
+              <h1 class="text-lg font-semibold">{task_display_name(@task)}</h1>
               <div class="text-sm text-gray-400">
                 <span class={status_color(@status)}>{status_text(@status)}</span>
                 <span :if={@current_tool} class="ml-2 text-yellow-400">
@@ -331,7 +328,7 @@ defmodule MiniMeWeb.SessionLive do
                 <div class="flex items-center gap-3 py-2">
                   <div class="flex-1 h-px bg-green-700"></div>
                   <span class="text-xs text-green-500 font-medium px-2">
-                    Claude Code Session Started
+                    Session Started
                   </span>
                   <div class="flex-1 h-px bg-green-700"></div>
                 </div>
@@ -428,13 +425,13 @@ defmodule MiniMeWeb.SessionLive do
   defp extract_tool_output(_result), do: "(no output)"
 
   defp add_message(socket, type, content) do
-    workspace_id = socket.assigns.workspace.id
+    task_id = socket.assigns.task.id
     execution_session_id = socket.assigns.execution_session_id
 
     # Persist to database
     {:ok, db_message} =
       Chat.create_message(%{
-        workspace_id: workspace_id,
+        task_id: task_id,
         execution_session_id: execution_session_id,
         type: to_string(type),
         content: content
@@ -460,12 +457,12 @@ defmodule MiniMeWeb.SessionLive do
       |> stream_insert(:messages, updated_msg)
     else
       # Create a new assistant message
-      workspace_id = socket.assigns.workspace.id
+      task_id = socket.assigns.task.id
       execution_session_id = socket.assigns.execution_session_id
 
       {:ok, db_message} =
         Chat.create_message(%{
-          workspace_id: workspace_id,
+          task_id: task_id,
           execution_session_id: execution_session_id,
           type: "assistant",
           content: text
@@ -489,8 +486,7 @@ defmodule MiniMeWeb.SessionLive do
   defp status_color(:ready), do: "text-green-400"
   defp status_color(:processing), do: "text-yellow-400"
   defp status_color(:connecting), do: "text-blue-400"
-  defp status_color(:cloning), do: "text-blue-400"
-  defp status_color(:starting_claude), do: "text-blue-400"
+  defp status_color(:starting_agent), do: "text-blue-400"
   defp status_color(:error), do: "text-red-400"
   defp status_color(:disconnected), do: "text-orange-400"
   defp status_color(:idle), do: "text-gray-400"
@@ -499,12 +495,11 @@ defmodule MiniMeWeb.SessionLive do
   defp status_text(:ready), do: "Ready"
   defp status_text(:processing), do: "Processing..."
   defp status_text(:connecting), do: "Connecting..."
-  defp status_text(:cloning), do: "Cloning repo..."
-  defp status_text(:starting_claude), do: "Starting Claude..."
+  defp status_text(:starting_agent), do: "Starting..."
   defp status_text(:error), do: "Error"
   defp status_text(:disconnected), do: "Disconnected"
   defp status_text(:initializing), do: "Initializing..."
-  defp status_text(:idle), do: "Idle (sprite sleeping)"
+  defp status_text(:idle), do: "Idle"
   defp status_text(status), do: to_string(status)
 
   defp session_end_color("completed"), do: "text-green-500"
@@ -546,4 +541,8 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   defp render_markdown(_), do: ""
+
+  defp task_display_name(%{title: title}) when is_binary(title) and title != "", do: title
+  defp task_display_name(%{repo: %{github_name: name}}) when is_binary(name), do: name
+  defp task_display_name(%{id: id}), do: "Task ##{id}"
 end

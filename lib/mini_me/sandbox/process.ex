@@ -123,7 +123,7 @@ defmodule MiniMe.Sandbox.Process do
         ""
       end
 
-    # Provide context about the workspace via system prompt
+    # Provide context about the task's repository via system prompt
     context_prompt =
       if repo_name do
         escaped = String.replace(repo_name, "'", "'\\''")

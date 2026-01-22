@@ -14,6 +14,8 @@ defmodule MiniMe.Application do
       {Phoenix.PubSub, name: MiniMe.PubSub},
       # Registry for session process lookup
       {Registry, keys: :unique, name: MiniMe.Sessions.Registry},
+      # Sprite allocator for managing sandbox allocation
+      MiniMe.Sandbox.Allocator,
       # DynamicSupervisor for user sessions
       {DynamicSupervisor, strategy: :one_for_one, name: MiniMe.SessionSupervisor},
       # Start to serve requests, typically the last entry

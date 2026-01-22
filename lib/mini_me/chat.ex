@@ -9,10 +9,10 @@ defmodule MiniMe.Chat do
   # Execution Sessions
 
   @doc """
-  Start a new execution session for a workspace.
+  Start a new execution session for a task on a specific sprite.
   """
-  def start_execution_session(workspace_id, session_type \\ "claude_code") do
-    ExecutionSession.start_changeset(workspace_id, session_type)
+  def start_execution_session(task_id, sprite_name, session_type \\ "claude_code") do
+    ExecutionSession.start_changeset(task_id, sprite_name, session_type)
     |> Repo.insert()
   end
 
@@ -35,11 +35,11 @@ defmodule MiniMe.Chat do
   end
 
   @doc """
-  Get the current active execution session for a workspace, if any.
+  Get the current active execution session for a task, if any.
   """
-  def get_active_session(workspace_id) do
+  def get_active_session(task_id) do
     ExecutionSession
-    |> where([s], s.workspace_id == ^workspace_id and s.status == "started")
+    |> where([s], s.task_id == ^task_id and s.status == "started")
     |> order_by([s], desc: s.started_at)
     |> limit(1)
     |> Repo.one()
@@ -48,7 +48,7 @@ defmodule MiniMe.Chat do
   # Messages
 
   @doc """
-  Create a message in a workspace.
+  Create a message in a task.
   """
   def create_message(attrs) do
     %Message{}
@@ -111,15 +111,15 @@ defmodule MiniMe.Chat do
   end
 
   @doc """
-  Get all messages for a workspace, ordered by insertion time.
+  Get all messages for a task, ordered by insertion time.
   Optionally preloads execution_session.
   """
-  def list_messages(workspace_id, opts \\ []) do
+  def list_messages(task_id, opts \\ []) do
     limit = Keyword.get(opts, :limit, 100)
 
     query =
       Message
-      |> where([m], m.workspace_id == ^workspace_id)
+      |> where([m], m.task_id == ^task_id)
       |> order_by([m], asc: m.inserted_at)
       |> limit(^limit)
 
@@ -134,11 +134,11 @@ defmodule MiniMe.Chat do
   end
 
   @doc """
-  Get messages for display in SessionLive.
+  Get messages for display in TaskLive.
   Returns messages in the format expected by the LiveView.
   """
-  def list_messages_for_display(workspace_id, opts \\ []) do
-    workspace_id
+  def list_messages_for_display(task_id, opts \\ []) do
+    task_id
     |> list_messages(opts)
     |> Enum.map(&Message.to_display/1)
   end
@@ -149,11 +149,11 @@ defmodule MiniMe.Chat do
   def get_message(id), do: Repo.get(Message, id)
 
   @doc """
-  Find a tool_call message by tool_use_id within a workspace.
+  Find a tool_call message by tool_use_id within a task.
   """
-  def find_tool_message(workspace_id, tool_use_id) do
+  def find_tool_message(task_id, tool_use_id) do
     Message
-    |> where([m], m.workspace_id == ^workspace_id and m.type == "tool_call")
+    |> where([m], m.task_id == ^task_id and m.type == "tool_call")
     |> where([m], fragment("?->>'tool_use_id' = ?", m.tool_data, ^tool_use_id))
     |> order_by([m], desc: m.inserted_at)
     |> limit(1)
