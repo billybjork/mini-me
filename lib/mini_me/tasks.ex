@@ -1,8 +1,9 @@
 defmodule MiniMe.Tasks do
   @moduledoc """
-  Context for managing tasks.
+  Context for managing tasks (conversations).
 
-  A task represents a user's work session with a GitHub repository running in a Sprite VM.
+  Tasks are conversations that may optionally be associated with a repository.
+  They are decoupled from infrastructure - sprites are allocated dynamically.
   """
 
   import Ecto.Query
@@ -12,76 +13,100 @@ defmodule MiniMe.Tasks do
   @doc """
   Get a task by ID.
   """
-  def get_task(id) do
-    Repo.get(Task, id)
-  end
+  def get_task(id), do: Repo.get(Task, id)
 
   @doc """
   Get a task by ID, raising if not found.
   """
-  def get_task!(id) do
-    Repo.get!(Task, id)
-  end
+  def get_task!(id), do: Repo.get!(Task, id)
 
   @doc """
-  Get a task by GitHub repo URL.
+  Get a task by ID with repo preloaded.
   """
-  def get_task_by_repo_url(url) do
-    Repo.get_by(Task, github_repo_url: url)
-  end
-
-  @doc """
-  Get a task by sprite name.
-  """
-  def get_task_by_sprite(sprite_name) do
-    Repo.get_by(Task, sprite_name: sprite_name)
-  end
-
-  @doc """
-  List all tasks.
-  """
-  def list_tasks do
+  def get_task_with_repo!(id) do
     Task
+    |> preload(:repo)
+    |> Repo.get!(id)
+  end
+
+  @doc """
+  List all tasks, ordered by most recently updated.
+  Optionally preload repo.
+  """
+  def list_tasks(opts \\ []) do
+    query =
+      Task
+      |> order_by(desc: :updated_at)
+
+    query =
+      if Keyword.get(opts, :preload_repo, false) do
+        preload(query, :repo)
+      else
+        query
+      end
+
+    Repo.all(query)
+  end
+
+  @doc """
+  List tasks by status.
+  """
+  def list_tasks_by_status(status) when status in ~w(active awaiting_input idle) do
+    Task
+    |> where([t], t.status == ^status)
     |> order_by(desc: :updated_at)
+    |> preload(:repo)
     |> Repo.all()
   end
 
   @doc """
   Create a new task.
   """
-  def create_task(attrs) do
+  def create_task(attrs \\ %{}) do
     %Task{}
     |> Task.changeset(attrs)
     |> Repo.insert()
   end
 
   @doc """
-  Create a task or return existing one for the given repo URL.
+  Create a task with an associated repo.
   """
-  def find_or_create_task(repo_url, repo_name) do
-    case get_task_by_repo_url(repo_url) do
-      nil ->
-        sprite_name = generate_sprite_name(repo_name)
+  def create_task_for_repo(repo) do
+    create_task(%{repo_id: repo.id})
+  end
 
-        create_task(%{
-          github_repo_url: repo_url,
-          github_repo_name: repo_name,
-          sprite_name: sprite_name
-        })
-
-      task ->
-        {:ok, task}
-    end
+  @doc """
+  Update a task.
+  """
+  def update_task(task, attrs) do
+    task
+    |> Task.changeset(attrs)
+    |> Repo.update()
   end
 
   @doc """
   Update task status.
   """
-  def update_status(task, status, error_message \\ nil) do
+  def update_status(task, status) when status in ~w(active awaiting_input idle) do
     task
-    |> Task.status_changeset(%{status: status, error_message: error_message})
+    |> Task.status_changeset(status)
     |> Repo.update()
   end
+
+  @doc """
+  Mark task as active (Claude is working).
+  """
+  def mark_active(task), do: update_status(task, "active")
+
+  @doc """
+  Mark task as awaiting input (Claude finished, user's turn).
+  """
+  def mark_awaiting_input(task), do: update_status(task, "awaiting_input")
+
+  @doc """
+  Mark task as idle (no activity).
+  """
+  def mark_idle(task), do: update_status(task, "idle")
 
   @doc """
   Delete a task. Returns :ok even if already deleted (idempotent).
@@ -93,19 +118,12 @@ defmodule MiniMe.Tasks do
     end
   end
 
-  # Private Functions
-
-  defp generate_sprite_name(repo_name) do
-    # Convert "owner/repo" to a valid sprite name
-    # Remove special characters and add a unique suffix
-    base =
-      repo_name
-      |> String.downcase()
-      |> String.replace(~r/[^a-z0-9]/, "-")
-      |> String.replace(~r/-+/, "-")
-      |> String.trim("-")
-
-    suffix = :crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)
-    "#{base}-#{suffix}"
+  @doc """
+  Touch the task's updated_at timestamp.
+  """
+  def touch(task) do
+    task
+    |> Ecto.Changeset.change()
+    |> Repo.update(force: true)
   end
 end

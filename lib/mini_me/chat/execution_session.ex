@@ -13,6 +13,7 @@ defmodule MiniMe.Chat.ExecutionSession do
   schema "execution_sessions" do
     field :session_type, :string, default: "claude_code"
     field :status, :string, default: "started"
+    field :sprite_name, :string
     field :started_at, :utc_datetime_usec
     field :ended_at, :utc_datetime_usec
     field :metadata, :map, default: %{}
@@ -25,15 +26,16 @@ defmodule MiniMe.Chat.ExecutionSession do
 
   def changeset(session, attrs) do
     session
-    |> cast(attrs, [:task_id, :session_type, :status, :started_at, :ended_at, :metadata])
+    |> cast(attrs, [:task_id, :session_type, :status, :sprite_name, :started_at, :ended_at, :metadata])
     |> validate_required([:task_id, :session_type, :status, :started_at])
     |> validate_inclusion(:status, @statuses)
     |> foreign_key_constraint(:task_id)
   end
 
-  def start_changeset(task_id, session_type \\ "claude_code") do
+  def start_changeset(task_id, sprite_name, session_type \\ "claude_code") do
     changeset(%__MODULE__{}, %{
       task_id: task_id,
+      sprite_name: sprite_name,
       session_type: session_type,
       status: "started",
       started_at: DateTime.utc_now()

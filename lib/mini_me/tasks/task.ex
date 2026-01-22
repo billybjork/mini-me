@@ -1,20 +1,28 @@
 defmodule MiniMe.Tasks.Task do
   @moduledoc """
-  Schema representing a task with a cloned GitHub repo in a Sprite VM.
+  Schema representing a task (conversation).
 
-  A task represents a user's work session - it connects a GitHub repository
-  to a Sprite environment where Claude can work on the code.
+  A task is a conversation that may optionally be associated with a GitHub
+  repository. Tasks are decoupled from infrastructure - sprites are allocated
+  dynamically when execution is needed.
+
+  Status is derived from execution state:
+  - :active - Claude is currently working
+  - :awaiting_input - Claude finished, waiting for user
+  - :idle - No recent activity
   """
   use Ecto.Schema
   import Ecto.Changeset
 
+  @statuses ~w(active awaiting_input idle)
+
   schema "tasks" do
-    field :github_repo_url, :string
-    field :github_repo_name, :string
-    field :sprite_name, :string
-    field :working_dir, :string, default: "/home/sprite/repo"
-    field :status, :string, default: "pending"
-    field :error_message, :string
+    field :title, :string
+    field :status, :string, default: "idle"
+
+    belongs_to :repo, MiniMe.Repos.Repo
+    has_many :messages, MiniMe.Chat.Message
+    has_many :execution_sessions, MiniMe.Chat.ExecutionSession
 
     timestamps(type: :utc_datetime)
   end
@@ -24,25 +32,15 @@ defmodule MiniMe.Tasks.Task do
   """
   def changeset(task, attrs) do
     task
-    |> cast(attrs, [
-      :github_repo_url,
-      :github_repo_name,
-      :sprite_name,
-      :working_dir,
-      :status,
-      :error_message
-    ])
-    |> validate_required([:github_repo_url, :github_repo_name, :sprite_name])
-    |> unique_constraint(:sprite_name)
-    |> unique_constraint(:github_repo_url)
+    |> cast(attrs, [:title, :status, :repo_id])
+    |> validate_inclusion(:status, @statuses)
+    |> foreign_key_constraint(:repo_id)
   end
 
   @doc """
   Changeset for updating task status.
   """
-  def status_changeset(task, attrs) do
-    task
-    |> cast(attrs, [:status, :error_message])
-    |> validate_inclusion(:status, ["pending", "creating", "cloning", "ready", "error"])
+  def status_changeset(task, status) when status in @statuses do
+    change(task, status: status)
   end
 end

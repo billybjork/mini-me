@@ -9,10 +9,10 @@ defmodule MiniMe.Chat do
   # Execution Sessions
 
   @doc """
-  Start a new execution session for a task.
+  Start a new execution session for a task on a specific sprite.
   """
-  def start_execution_session(task_id, session_type \\ "claude_code") do
-    ExecutionSession.start_changeset(task_id, session_type)
+  def start_execution_session(task_id, sprite_name, session_type \\ "claude_code") do
+    ExecutionSession.start_changeset(task_id, sprite_name, session_type)
     |> Repo.insert()
   end
 

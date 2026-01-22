@@ -10,7 +10,7 @@ defmodule MiniMeWeb.SessionLive do
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do
-    task = Tasks.get_task!(id)
+    task = Tasks.get_task_with_repo!(id)
 
     # Load persisted messages
     messages = Chat.list_messages_for_display(task.id)
@@ -300,7 +300,7 @@ defmodule MiniMeWeb.SessionLive do
         <header class="flex-none p-4 border-b border-gray-700">
           <div class="flex items-center justify-between">
             <div>
-              <h1 class="text-lg font-semibold">{@task.github_repo_name}</h1>
+              <h1 class="text-lg font-semibold">{task_display_name(@task)}</h1>
               <div class="text-sm text-gray-400">
                 <span class={status_color(@status)}>{status_text(@status)}</span>
                 <span :if={@current_tool} class="ml-2 text-yellow-400">
@@ -546,4 +546,8 @@ defmodule MiniMeWeb.SessionLive do
   end
 
   defp render_markdown(_), do: ""
+
+  defp task_display_name(%{title: title}) when is_binary(title) and title != "", do: title
+  defp task_display_name(%{repo: %{github_name: name}}) when is_binary(name), do: name
+  defp task_display_name(%{id: id}), do: "Task ##{id}"
 end

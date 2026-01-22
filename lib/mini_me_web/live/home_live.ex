@@ -1,75 +1,72 @@
 defmodule MiniMeWeb.HomeLive do
   @moduledoc """
-  Home page LiveView - displays repo selector and recent tasks.
+  Home page LiveView - displays task list and repo selector.
   """
   use MiniMeWeb, :live_view
 
   alias MiniMe.GitHub
-  alias MiniMe.Sandbox.Client
-  alias MiniMe.Tasks
+  alias MiniMe.Sandbox.{Allocator, Client}
+  alias MiniMe.{Tasks, Repos}
 
-  # Poll for sprite status updates every 5 seconds
+  # Poll for status updates every 5 seconds
   @status_poll_interval :timer.seconds(5)
 
   @impl true
   def mount(_params, _session, socket) do
-    tasks = Tasks.list_tasks()
+    tasks = Tasks.list_tasks(preload_repo: true)
     tasks_map = Map.new(tasks, &{&1.id, &1})
 
     socket =
       socket
-      |> assign(:repos, [])
+      |> assign(:github_repos, [])
       |> stream(:tasks, tasks)
       |> assign(:tasks_map, tasks_map)
-      |> assign(:sprite_statuses, %{})
+      |> assign(:sprite_status, nil)
       |> assign(:loading, true)
       |> assign(:error, nil)
       |> assign(:selected_repo, nil)
       |> assign(:deleting, nil)
 
-    # Load repos and sprite statuses asynchronously
+    # Load data asynchronously
     if connected?(socket) do
-      send(self(), :load_repos)
-      send(self(), :load_sprite_statuses)
+      send(self(), :load_github_repos)
+      send(self(), :load_sprite_status)
     end
 
     {:ok, socket}
   end
 
   @impl true
-  def handle_info(:load_repos, socket) do
+  def handle_info(:load_github_repos, socket) do
     case GitHub.list_repos() do
       {:ok, repos} ->
-        {:noreply, assign(socket, repos: repos, loading: false)}
+        {:noreply, assign(socket, github_repos: repos, loading: false)}
 
       {:error, reason} ->
         {:noreply, assign(socket, error: reason, loading: false)}
     end
   end
 
-  def handle_info(:load_sprite_statuses, socket) do
-    # Fetch real-time sprite statuses from the API
-    sprite_statuses =
-      case Client.list_sprites() do
-        {:ok, sprites} when is_list(sprites) ->
-          Map.new(sprites, fn sprite ->
-            {sprite["name"], sprite["status"]}
-          end)
+  def handle_info(:load_sprite_status, socket) do
+    # Get status of the default sprite
+    sprite_name = Allocator.default_sprite_name()
 
-        _ ->
-          socket.assigns.sprite_statuses
+    sprite_status =
+      case Client.get_sprite(sprite_name) do
+        {:ok, sprite} -> sprite["status"]
+        _ -> nil
       end
 
-    # Also refresh tasks in case they changed
-    tasks = Tasks.list_tasks()
+    # Refresh tasks
+    tasks = Tasks.list_tasks(preload_repo: true)
     tasks_map = Map.new(tasks, &{&1.id, &1})
 
     # Schedule next poll
-    Process.send_after(self(), :load_sprite_statuses, @status_poll_interval)
+    Process.send_after(self(), :load_sprite_status, @status_poll_interval)
 
     socket =
       socket
-      |> assign(:sprite_statuses, sprite_statuses)
+      |> assign(:sprite_status, sprite_status)
       |> assign(:tasks_map, tasks_map)
       |> stream(:tasks, tasks, reset: true)
 
@@ -103,14 +100,31 @@ defmodule MiniMeWeb.HomeLive do
         {:noreply, put_flash(socket, :error, "Please select a repository")}
 
       %{url: url, name: name} ->
-        case Tasks.find_or_create_task(url, name) do
-          {:ok, task} ->
-            {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
+        # Find or create the repo, then create a task for it
+        with {:ok, repo} <- Repos.find_or_create_repo(url, name),
+             {:ok, task} <- Tasks.create_task_for_repo(repo) do
+          # Pre-warm the sprite in background
+          task_with_repo = %{task | repo: repo}
+          Allocator.allocate(task_with_repo, prewarm: true)
 
+          {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
+        else
           {:error, changeset} ->
             {:noreply,
              put_flash(socket, :error, "Failed to create task: #{inspect(changeset.errors)}")}
         end
+    end
+  end
+
+  def handle_event("new_task", _params, socket) do
+    # Create a task without a repo
+    case Tasks.create_task() do
+      {:ok, task} ->
+        {:noreply, push_navigate(socket, to: ~p"/session/#{task.id}")}
+
+      {:error, changeset} ->
+        {:noreply,
+         put_flash(socket, :error, "Failed to create task: #{inspect(changeset.errors)}")}
     end
   end
 
@@ -121,7 +135,6 @@ defmodule MiniMeWeb.HomeLive do
   def handle_event("delete_task", %{"id" => id}, socket) do
     task_id = String.to_integer(id)
 
-    # Guard against double-clicks - ignore if already deleting this task
     if socket.assigns.deleting == task_id do
       {:noreply, socket}
     else
@@ -131,10 +144,19 @@ defmodule MiniMeWeb.HomeLive do
     end
   end
 
-  def handle_event("sleep_sprite", %{"id" => id}, socket) do
-    socket.assigns.tasks_map
-    |> Map.get(String.to_integer(id))
-    |> do_sleep_sprite(socket)
+  def handle_event("sleep_sprite", _params, socket) do
+    sprite_name = Allocator.default_sprite_name()
+
+    # Optimistic update
+    socket = assign(socket, :sprite_status, "suspending")
+
+    # Kill Claude and suspend in background
+    Task.start(fn ->
+      Client.exec(sprite_name, "pkill -f 'claude --print' || true", timeout: 5_000)
+      Client.suspend_sprite(sprite_name)
+    end)
+
+    {:noreply, socket}
   end
 
   defp do_delete_task(nil, socket), do: {:noreply, socket}
@@ -143,10 +165,7 @@ defmodule MiniMeWeb.HomeLive do
     socket = assign(socket, deleting: task.id)
     liveview_pid = self()
 
-    # Delete sprite first, then task (in background)
     Task.start(fn ->
-      Client.delete_sprite(task.sprite_name)
-      # Use Repo.delete with allow_stale to handle race conditions
       Tasks.delete_task(task)
       send(liveview_pid, {:task_deleted, task.id})
     end)
@@ -154,41 +173,28 @@ defmodule MiniMeWeb.HomeLive do
     {:noreply, socket}
   end
 
-  defp do_sleep_sprite(nil, socket), do: {:noreply, socket}
-
-  defp do_sleep_sprite(task, socket) do
-    sprite_status = Map.get(socket.assigns.sprite_statuses, task.sprite_name)
-
-    # Optimistic update - show transitional state
-    sprite_statuses = Map.put(socket.assigns.sprite_statuses, task.sprite_name, "suspending")
-    socket = assign(socket, :sprite_statuses, sprite_statuses)
-
-    # Only kill Claude if sprite is actually running (avoid waking it up)
-    maybe_kill_claude(task, sprite_status)
-
-    # Suspend in background - the regular poll will refresh the status
-    Task.start(fn -> Client.suspend_sprite(task.sprite_name) end)
-
-    {:noreply, socket}
-  end
-
-  defp maybe_kill_claude(task, "running") do
-    Task.start(fn ->
-      Client.exec(task.sprite_name, "pkill -f 'claude --print' || true", timeout: 5_000)
-    end)
-  end
-
-  defp maybe_kill_claude(_task, _status), do: :ok
-
   @impl true
   def render(assigns) do
     ~H"""
     <Layouts.full_screen flash={@flash}>
       <div class="min-h-screen bg-gray-900 text-white">
         <div class="max-w-4xl mx-auto px-4 py-8">
-          <h1 class="text-3xl font-bold mb-8">Mini Me</h1>
+          <div class="flex items-center justify-between mb-8">
+            <h1 class="text-3xl font-bold">Mini Me</h1>
+            <.sprite_indicator status={@sprite_status} />
+          </div>
 
-    <!-- Recent Tasks -->
+          <!-- New Task Button -->
+          <div class="mb-8">
+            <button
+              phx-click="new_task"
+              class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold transition-colors"
+            >
+              + New Task
+            </button>
+          </div>
+
+          <!-- Recent Tasks -->
           <div :if={map_size(@tasks_map) > 0} class="mb-8">
             <h2 class="text-xl font-semibold mb-4">Recent Tasks</h2>
             <div class="space-y-2" id="tasks" phx-update="stream">
@@ -203,34 +209,20 @@ defmodule MiniMeWeb.HomeLive do
                   class="flex-1 text-left p-4 bg-gray-800 rounded-lg hover:bg-gray-700 transition-colors"
                 >
                   <div class="flex items-center justify-between">
-                    <div class="font-medium">{task.github_repo_name}</div>
-                    <.sprite_status_badge
-                      sprite_name={task.sprite_name}
-                      sprite_statuses={@sprite_statuses}
-                    />
+                    <div class="font-medium">
+                      {task_display_name(task)}
+                    </div>
+                    <.task_status_badge status={task.status} />
                   </div>
-                  <div class="text-sm text-gray-400 mt-1">
-                    <.task_status_text
-                      status={task.status}
-                      sprite_status={Map.get(@sprite_statuses, task.sprite_name)}
-                    />
+                  <div :if={task.repo} class="text-sm text-gray-500 mt-1">
+                    {task.repo.github_name}
                   </div>
-                </button>
-                <button
-                  :if={Map.get(@sprite_statuses, task.sprite_name) in ["running"]}
-                  phx-click="sleep_sprite"
-                  phx-value-id={task.id}
-                  phx-disable-with="..."
-                  class="p-3 rounded-lg transition-colors bg-gray-800 hover:bg-blue-900 text-gray-400 hover:text-blue-400"
-                  title="Put sprite to sleep (stops charges)"
-                >
-                  ⏸
                 </button>
                 <button
                   phx-click="delete_task"
                   phx-value-id={task.id}
                   phx-disable-with="..."
-                  data-confirm="Delete this task and its sprite? This cannot be undone."
+                  data-confirm="Delete this task? This cannot be undone."
                   class={[
                     "p-3 rounded-lg transition-colors",
                     if(@deleting == task.id,
@@ -239,17 +231,17 @@ defmodule MiniMeWeb.HomeLive do
                     )
                   ]}
                   disabled={@deleting == task.id}
-                  title="Delete task and sprite"
+                  title="Delete task"
                 >
                   {if @deleting == task.id, do: "...", else: "×"}
                 </button>
               </div>
             </div>
           </div>
-          
-    <!-- Repository Selector -->
+
+          <!-- Repository Selector -->
           <div class="mb-8">
-            <h2 class="text-xl font-semibold mb-4">Start New Session</h2>
+            <h2 class="text-xl font-semibold mb-4">Start Task with Repository</h2>
 
             <div :if={@loading} class="text-gray-400">
               Loading repositories...
@@ -265,7 +257,7 @@ defmodule MiniMeWeb.HomeLive do
             <div :if={!@loading && @error == nil} class="space-y-4">
               <div class="grid gap-2 max-h-96 overflow-y-auto">
                 <button
-                  :for={repo <- @repos}
+                  :for={repo <- @github_repos}
                   phx-click="select_repo"
                   phx-value-url={repo.url}
                   phx-value-name={repo.full_name}
@@ -290,9 +282,9 @@ defmodule MiniMeWeb.HomeLive do
               <button
                 :if={@selected_repo}
                 phx-click="start_session"
-                class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold transition-colors"
+                class="w-full py-3 px-4 bg-green-600 hover:bg-green-700 rounded-lg font-semibold transition-colors"
               >
-                Start Session with {@selected_repo.name}
+                Start with {@selected_repo.name}
               </button>
             </div>
           </div>
@@ -302,24 +294,31 @@ defmodule MiniMeWeb.HomeLive do
     """
   end
 
-  # Component for sprite status badge (running vs hibernating)
-  defp sprite_status_badge(assigns) do
-    sprite_status = Map.get(assigns.sprite_statuses, assigns.sprite_name)
+  # Display name for a task
+  defp task_display_name(%{title: title}) when is_binary(title) and title != "", do: title
+  defp task_display_name(%{repo: %{github_name: name}}) when is_binary(name), do: name
+  defp task_display_name(%{id: id}), do: "Task ##{id}"
 
-    assigns = assign(assigns, :sprite_status, sprite_status)
-
+  # Sprite status indicator (for the shared sprite)
+  defp sprite_indicator(assigns) do
     ~H"""
-    <span class={[
-      "inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium",
-      sprite_status_classes(@sprite_status)
-    ]}>
+    <div class="flex items-center gap-2">
+      <button
+        :if={@status == "running"}
+        phx-click="sleep_sprite"
+        class="text-sm px-3 py-1 bg-gray-800 hover:bg-blue-900 rounded text-gray-400 hover:text-blue-400 transition-colors"
+        title="Put environment to sleep"
+      >
+        ⏸ Sleep
+      </button>
       <span class={[
-        "w-2 h-2 rounded-full",
-        sprite_dot_classes(@sprite_status)
+        "inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium",
+        sprite_status_classes(@status)
       ]}>
+        <span class={["w-2 h-2 rounded-full", sprite_dot_classes(@status)]}></span>
+        {sprite_status_text(@status)}
       </span>
-      {sprite_status_text(@sprite_status)}
-    </span>
+    </div>
     """
   end
 
@@ -337,43 +336,38 @@ defmodule MiniMeWeb.HomeLive do
   defp sprite_dot_classes(nil), do: "bg-gray-600"
   defp sprite_dot_classes(_), do: "bg-blue-400"
 
-  # Show raw API status values for clarity
-  defp sprite_status_text("running"), do: "running"
-  defp sprite_status_text("warm"), do: "warm"
-  defp sprite_status_text("suspending"), do: "suspending..."
-  defp sprite_status_text("cold"), do: "cold"
-  defp sprite_status_text(nil), do: "?"
+  defp sprite_status_text("running"), do: "Environment running"
+  defp sprite_status_text("warm"), do: "Environment warm"
+  defp sprite_status_text("suspending"), do: "Suspending..."
+  defp sprite_status_text("cold"), do: "Environment sleeping"
+  defp sprite_status_text(nil), do: "No environment"
   defp sprite_status_text(status), do: status
 
-  # Component for task status text
-  attr :status, :string, required: true
-  attr :sprite_status, :string, default: nil
-
-  defp task_status_text(assigns) do
-    # Detect stale status: sprite is cold but task is in an intermediate state
-    is_stale = assigns.sprite_status == "cold" and assigns.status in ["creating", "cloning"]
-
-    assigns = assign(assigns, :is_stale, is_stale)
-
+  # Task status badge
+  defp task_status_badge(assigns) do
     ~H"""
-    <span :if={@is_stale} class="text-orange-400">
-      Setup interrupted - will resume on open
-    </span>
-    <span :if={!@is_stale} class={task_status_classes(@status)}>
+    <span class={[
+      "inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium",
+      task_status_classes(@status)
+    ]}>
+      <span class={["w-1.5 h-1.5 rounded-full", task_dot_classes(@status)]}></span>
       {task_status_label(@status)}
     </span>
     """
   end
 
-  defp task_status_classes("ready"), do: "text-green-400"
-  defp task_status_classes("error"), do: "text-red-400"
-  defp task_status_classes("pending"), do: "text-gray-500"
-  defp task_status_classes(_), do: "text-yellow-400"
+  defp task_status_classes("active"), do: "bg-green-900/50 text-green-400"
+  defp task_status_classes("awaiting_input"), do: "bg-yellow-900/50 text-yellow-400"
+  defp task_status_classes("idle"), do: "bg-gray-700 text-gray-400"
+  defp task_status_classes(_), do: "bg-gray-700 text-gray-500"
 
-  defp task_status_label("ready"), do: "Ready"
-  defp task_status_label("pending"), do: "Pending"
-  defp task_status_label("creating"), do: "Creating sprite..."
-  defp task_status_label("cloning"), do: "Cloning repo..."
-  defp task_status_label("error"), do: "Error"
+  defp task_dot_classes("active"), do: "bg-green-400 animate-pulse"
+  defp task_dot_classes("awaiting_input"), do: "bg-yellow-400"
+  defp task_dot_classes("idle"), do: "bg-gray-500"
+  defp task_dot_classes(_), do: "bg-gray-600"
+
+  defp task_status_label("active"), do: "Active"
+  defp task_status_label("awaiting_input"), do: "Your turn"
+  defp task_status_label("idle"), do: "Idle"
   defp task_status_label(status), do: status
 end
