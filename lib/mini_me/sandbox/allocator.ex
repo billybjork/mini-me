@@ -72,8 +72,6 @@ defmodule MiniMe.Sandbox.Allocator do
   @impl true
   def init(_opts) do
     state = %{
-      # Map of repo_id => task_id (which task has the lock)
-      repo_locks: %{},
       # Map of task_id => %{sprite_name, repo_id, allocated_at}
       allocations: %{},
       # Map of task_id => %{sprite_name, working_dir} - cached prewarm results
@@ -123,7 +121,13 @@ defmodule MiniMe.Sandbox.Allocator do
   end
 
   def handle_call({:repo_locked?, repo_id}, _from, state) do
-    locked = Map.has_key?(state.repo_locks, repo_id)
+    import Ecto.Query
+
+    locked =
+      MiniMe.Repos.Repo
+      |> where([r], r.id == ^repo_id and not is_nil(r.locked_by_task_id))
+      |> MiniMe.Repo.exists?()
+
     {:reply, locked, state}
   end
 
@@ -261,32 +265,61 @@ defmodule MiniMe.Sandbox.Allocator do
   end
 
   defp check_and_acquire_lock(state, task_id, repo_id) do
-    case Map.get(state.repo_locks, repo_id) do
-      nil ->
-        # Acquire lock
-        state = put_in(state.repo_locks[repo_id], task_id)
-        {:ok, state}
+    # Use database transaction to atomically check and acquire lock
+    import Ecto.Query
 
-      ^task_id ->
-        # Already have the lock
-        {:ok, state}
+    result =
+      MiniMe.Repo.transaction(fn ->
+        repo =
+          MiniMe.Repos.Repo
+          |> where([r], r.id == ^repo_id)
+          |> lock("FOR UPDATE")
+          |> MiniMe.Repo.one()
 
-      other_task_id ->
-        # Locked by another task
-        {:error, :repo_locked, other_task_id}
+        case repo do
+          nil ->
+            {:error, :repo_not_found}
+
+          %{locked_by_task_id: nil} ->
+            # Lock is available, acquire it
+            repo
+            |> Ecto.Changeset.change(%{
+              locked_by_task_id: task_id,
+              locked_at: DateTime.utc_now()
+            })
+            |> MiniMe.Repo.update!()
+
+            :ok
+
+          %{locked_by_task_id: ^task_id} ->
+            # Already have the lock
+            :ok
+
+          %{locked_by_task_id: other_task_id} ->
+            # Locked by another task
+            {:error, :repo_locked, other_task_id}
+        end
+      end)
+
+    case result do
+      {:ok, :ok} -> {:ok, state}
+      {:ok, {:error, :repo_locked, other_task_id}} -> {:error, :repo_locked, other_task_id}
+      {:ok, {:error, :repo_not_found}} -> {:error, :repo_not_found}
+      {:error, _} = error -> error
     end
   end
 
   defp release_lock(state, _task_id, nil), do: state
 
   defp release_lock(state, task_id, repo_id) do
-    case Map.get(state.repo_locks, repo_id) do
-      ^task_id ->
-        Map.update!(state, :repo_locks, &Map.delete(&1, repo_id))
+    # Release database lock
+    import Ecto.Query
 
-      _ ->
-        state
-    end
+    MiniMe.Repos.Repo
+    |> where([r], r.id == ^repo_id and r.locked_by_task_id == ^task_id)
+    |> MiniMe.Repo.update_all(set: [locked_by_task_id: nil, locked_at: nil])
+
+    state
   end
 
   defp setup_sprite_for_task(task) do
