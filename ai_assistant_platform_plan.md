@@ -98,29 +98,32 @@ This separation of concerns (brain vs. hands) matches proven orchestrator-worker
 
 ```
 User
- ├── Workspace (1:1) ──── Sprite (1:1)
- │    │                    └── Checkpoints
+ ├── Tasks (1:many) ──── Repo (many:1, optional)
  │    ├── Messages (1:many)
  │    └── ExecutionSessions (1:many)
  │         └── Messages (1:many, optional)
  │
- ├── Tasks (1:many)
- │    └── Jobs (1:many) ── within sprite
+ ├── Repos (1:many) ──── registered GitHub repos
+ │
  ├── Credentials (1:many)
  ├── Connectors (1:many)
  └── Schedules (1:many)
+
+Sprite (shared, single instance for MVP)
+ └── Checkpoints
 ```
+
+**Note**: For MVP, all users share a single default sprite. The outer loop manages repo locking to ensure only one active task uses a given repo at a time.
 
 ### Key Entities
 
 | Entity | Purpose | Key Fields |
 |--------|---------|------------|
 | **User** | Account & auth | email, tier, status |
-| **Workspace** | User's sprite config | sprite_id, storage_used, config |
-| **Message** | Chat message in conversation | workspace_id, execution_session_id, type, content, tool_data |
-| **ExecutionSession** | Agent execution boundary | workspace_id, session_type, status, started_at, ended_at |
-| **Task** | User request (outer loop) | input, status, routing_decision, result, artifacts |
-| **Job** | Execution instance (inner loop) | task_id, working_dir, pid, status, output_log |
+| **Task** | Conversation/work unit | title, repo_id (optional), status (active/awaiting_input/idle) |
+| **Repo** | GitHub repository | github_url, github_name, default_branch |
+| **Message** | Chat message in conversation | task_id, execution_session_id, type, content, tool_data |
+| **ExecutionSession** | Agent execution boundary | task_id, sprite_name, session_type, status, started_at, ended_at |
 | **Checkpoint** | Sprite state snapshot | sprite_checkpoint_id, label, created_at |
 | **Credential** | Encrypted secret | key, type, encrypted_value, permissions |
 | **Connector** | Input/output channel | type (sms/slack/etc), config, auth_data |
@@ -129,9 +132,11 @@ User
 | **Skill** | Prompt + tools bundle | prompt_template, required_tools |
 | **App** | Pre-packaged environment | setup_script, launch_command, port |
 
-**Message & ExecutionSession**: Messages are persisted chat records (user, assistant, system, tool_call, error). An ExecutionSession tracks when an agent (e.g., Claude Code) has active context—messages within a session share that agent's memory. When a session ends (completed/failed/interrupted), subsequent messages start fresh. Messages can exist without a session (general chat) or within one (agent execution). This distinction is surfaced in the UI with visual session boundaries.
+**Task**: A task is essentially a conversation - the primary unit of work in the system. Tasks can optionally be associated with a GitHub repo for code-related work, but standalone tasks are equally valid. Task status reflects the conversation state: `active` (agent working), `awaiting_input` (agent finished, user's turn), `idle` (no recent activity, agent suspended).
 
-**Task vs Job**: A Task is the user-facing request managed by the outer loop. A Job is a single execution instance in the sprite. One task can spawn multiple jobs on retry (failed job → new job, same task) or if we later support parallel subtask decomposition. For MVP, most tasks have a single job.
+**Message & ExecutionSession**: Messages are persisted chat records (user, assistant, system, tool_call, error). An ExecutionSession tracks when an agent has active context—messages within a session share that agent's memory. When a session ends (completed/failed/interrupted), subsequent messages start fresh. Messages can exist without a session (general chat) or within one (agent execution). This distinction is surfaced in the UI with visual session boundaries.
+
+**Repo Locking**: For MVP, only one active task can work on a given repo at a time. This prevents file conflicts in the shared sprite. The allocator tracks which task holds the lock and releases it when the task goes idle or is deleted.
 
 ### Task State Machine
 
@@ -194,7 +199,7 @@ Inactivity = no active exec sessions. Long-running jobs (video transcode, large 
 
 When a sprite wakes from hibernation:
 1. Control plane receives wake notification
-2. Outer loop fetches user context (workspace config, pending state)
+2. Outer loop fetches task context (repo info, pending state)
 3. Credentials injected as env vars for the session (scoped, temporary)
 4. Sprite is ready to receive `exec()` calls
 
@@ -225,8 +230,8 @@ USER A'S SPRITE (single VM, multiple sessions)
 ├── Session 2: Inner Agent executing Task 2
 │
 ├── /home/user/jobs/
-│   ├── task-1/  (Task 1's isolated workspace)
-│   └── task-2/  (Task 2's isolated workspace)
+│   ├── task-1/  (Task 1's working directory)
+│   └── task-2/  (Task 2's working directory)
 │
 └── Shared: installed tools, caches, user config
 ```
@@ -351,7 +356,7 @@ Inbound message → Identify user (phone/email/slack ID) → Load context → Ro
 - Checkpoint **before** risky operations (third-party agents, destructive actions)
 - Tag checkpoints as **stable** on successful task completion (used for recovery)
 - Keep last **7 days** of checkpoints
-- Max **20 checkpoints** per workspace (prune oldest, but always retain most recent stable checkpoint)
+- Max **20 checkpoints** per sprite (prune oldest, but always retain most recent stable checkpoint)
 
 ---
 
@@ -477,7 +482,7 @@ User doesn't see infrastructure details, just minutes consumed.
 | Area | Decision | Rationale |
 |------|----------|-----------|
 | Architecture | Outer loop (Elixir) + Inner loop (Sprite) | Separation of concerns: orchestration vs execution |
-| Sprites | One per user | Consolidates deps, simplifies context |
+| Sprites | Single shared (MVP), per-user later | MVP simplicity; repo locking prevents conflicts |
 | Concurrency | Outer loop manages | Sprite API supports multiple sessions; Elixir handles scheduling |
 | Technology | Elixir/Phoenix + PostgreSQL | OTP fault tolerance, LiveView for real-time UI |
 | LLM Integration | Custom thin client, no frameworks | Simple API, fewer deps, full control |
@@ -511,7 +516,7 @@ User doesn't see infrastructure details, just minutes consumed.
 
 ### Phase 1: Foundation (Weeks 1-4)
 - [ ] Phoenix project with basic auth
-- [ ] PostgreSQL schema (User, Workspace, Task)
+- [ ] PostgreSQL schema (User, Task, Repo, Message, ExecutionSession)
 - [ ] Sprite API client (Elixir wrapper)
 - [ ] Platform.LLM module (Anthropic client)
 - [ ] Web UI skeleton (LiveView)
@@ -626,7 +631,7 @@ defmodule Platform.TaskProcessor do
   
   def handle_continue(:route, %{state: :routing} = data) do
     skill = Router.select_skill(data.intent)
-    {:ok, session} = Sprite.exec(data.workspace.sprite_id, build_command(skill))
+    {:ok, session} = Sprite.exec(sprite_name, build_command(skill))
     {:noreply, %{data | state: :executing, session: session}}
   end
 end
