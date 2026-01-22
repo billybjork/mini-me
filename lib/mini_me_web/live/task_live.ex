@@ -1,6 +1,6 @@
 defmodule MiniMeWeb.TaskLive do
   @moduledoc """
-  LiveView for a single task - chat interface for interacting with Claude Code.
+  LiveView for a single task - chat interface for agent conversations.
   """
   use MiniMeWeb, :live_view
 
@@ -108,8 +108,8 @@ defmodule MiniMeWeb.TaskLive do
         :connecting ->
           add_message(socket, :system, "Connecting to sandbox...")
 
-        :starting_claude ->
-          add_message(socket, :system, "Starting Claude Code...")
+        :starting_agent ->
+          add_message(socket, :system, "Starting agent...")
 
         :ready ->
           socket
@@ -328,7 +328,7 @@ defmodule MiniMeWeb.TaskLive do
                 <div class="flex items-center gap-3 py-2">
                   <div class="flex-1 h-px bg-green-700"></div>
                   <span class="text-xs text-green-500 font-medium px-2">
-                    Claude Code Session Started
+                    Session Started
                   </span>
                   <div class="flex-1 h-px bg-green-700"></div>
                 </div>
@@ -486,7 +486,7 @@ defmodule MiniMeWeb.TaskLive do
   defp status_color(:ready), do: "text-green-400"
   defp status_color(:processing), do: "text-yellow-400"
   defp status_color(:connecting), do: "text-blue-400"
-  defp status_color(:starting_claude), do: "text-blue-400"
+  defp status_color(:starting_agent), do: "text-blue-400"
   defp status_color(:error), do: "text-red-400"
   defp status_color(:disconnected), do: "text-orange-400"
   defp status_color(:idle), do: "text-gray-400"
@@ -495,11 +495,11 @@ defmodule MiniMeWeb.TaskLive do
   defp status_text(:ready), do: "Ready"
   defp status_text(:processing), do: "Processing..."
   defp status_text(:connecting), do: "Connecting..."
-  defp status_text(:starting_claude), do: "Starting Claude..."
+  defp status_text(:starting_agent), do: "Starting..."
   defp status_text(:error), do: "Error"
   defp status_text(:disconnected), do: "Disconnected"
   defp status_text(:initializing), do: "Initializing..."
-  defp status_text(:idle), do: "Idle (sprite sleeping)"
+  defp status_text(:idle), do: "Idle"
   defp status_text(status), do: to_string(status)
 
   defp session_end_color("completed"), do: "text-green-500"

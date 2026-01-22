@@ -133,7 +133,7 @@ defmodule MiniMe.Sessions.UserSession do
         Tasks.mark_active(state.task)
 
         state = %{state | sprite_name: sprite_name, working_dir: working_dir}
-        broadcast(state, {:session_status, :starting_claude})
+        broadcast(state, {:session_status, :starting_agent})
         start_claude_code(state)
 
       {:error, {:repo_locked, other_task_id}} ->
@@ -287,7 +287,7 @@ defmodule MiniMe.Sessions.UserSession do
       GenServer.stop(state.process_pid, :normal)
     end
 
-    broadcast(state, {:session_status, :starting_claude})
+    broadcast(state, {:session_status, :starting_agent})
 
     repo_name = state.task.repo && state.task.repo.github_name
 
