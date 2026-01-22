@@ -125,16 +125,24 @@ defmodule MiniMe.Sessions.UserSession do
   @impl true
   def handle_info(:initialize, state) do
     # Reload task from DB to avoid stale struct issues (e.g., after supervisor restart)
-    case Tasks.get_task(state.task.id) do
-      nil ->
-        Logger.warning("Task #{state.task.id} no longer exists, stopping session")
-        {:stop, :normal, state}
+    # Handle DB connection errors gracefully
+    try do
+      case Tasks.get_task(state.task.id) do
+        nil ->
+          Logger.warning("Task #{state.task.id} no longer exists, stopping session")
+          {:stop, :normal, state}
 
-      task ->
-        # Preload repo if the task has one
-        task = if task.repo_id, do: MiniMe.Repo.preload(task, :repo), else: task
-        state = %{state | task: task}
-        do_initialize(state)
+        task ->
+          # Preload repo if the task has one
+          task = if task.repo_id, do: MiniMe.Repo.preload(task, :repo), else: task
+          state = %{state | task: task}
+          do_initialize(state)
+      end
+    rescue
+      e in DBConnection.ConnectionError ->
+        Logger.error("Database unavailable during session init: #{Exception.message(e)}")
+        broadcast(state, {:agent_error, "Database temporarily unavailable"})
+        {:stop, {:shutdown, :db_unavailable}, state}
     end
   end
 
@@ -267,7 +275,8 @@ defmodule MiniMe.Sessions.UserSession do
   # Private Functions
 
   defp do_initialize(state) do
-    broadcast(state, {:session_status, :connecting})
+    # Broadcast allocating status while repo is being prepared
+    broadcast(state, {:session_status, :allocating})
 
     # Use SpriteAllocator to get a sprite and ensure repo is cloned
     case Allocator.allocate(state.task) do
@@ -312,6 +321,7 @@ defmodule MiniMe.Sessions.UserSession do
            repo_name: repo_name
          ) do
       {:ok, pid} ->
+        broadcast(state, {:session_status, :connecting})
         {:noreply, %{state | process_pid: pid, status: :connecting}}
 
       {:error, reason} ->

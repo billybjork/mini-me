@@ -38,7 +38,16 @@ if config_env() == :prod do
   config :mini_me, MiniMe.Repo,
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
-    socket_options: maybe_ipv6
+    socket_options: maybe_ipv6,
+    # Connection pool tuning for resilience
+    queue_target: 5_000,
+    queue_interval: 1_000,
+    # Detect dead connections faster with TCP keepalive
+    parameters: [
+      tcp_keepalives_idle: "60",
+      tcp_keepalives_interval: "10",
+      tcp_keepalives_count: "3"
+    ]
 
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||

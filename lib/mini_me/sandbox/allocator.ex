@@ -21,6 +21,8 @@ defmodule MiniMe.Sandbox.Allocator do
   alias MiniMe.Repos
 
   @default_sprite_name "mini-me-default"
+  @lock_expiration_ms :timer.hours(1)
+  @cleanup_interval_ms :timer.minutes(15)
 
   # Client API
 
@@ -71,6 +73,12 @@ defmodule MiniMe.Sandbox.Allocator do
 
   @impl true
   def init(_opts) do
+    # Clean up any stale locks from previous runs
+    cleanup_stale_locks()
+
+    # Schedule periodic cleanup
+    schedule_cleanup()
+
     state = %{
       # Map of task_id => %{sprite_name, repo_id, allocated_at}
       allocations: %{},
@@ -169,24 +177,26 @@ defmodule MiniMe.Sandbox.Allocator do
 
   @impl true
   def handle_cast({:prewarm, task}, state) do
-    # Mark as prewarming
-    state = Map.update!(state, :prewarming, &MapSet.put(&1, task.id))
-    allocator_pid = self()
+    # Skip if already prewarming or cached (idempotent)
+    already_prewarming = MapSet.member?(state.prewarming, task.id)
+    already_cached = Map.has_key?(state.prewarm_cache, task.id)
 
-    # Pre-warm in background, cache result when done
-    spawn(fn ->
-      case setup_sprite_for_task(task) do
-        {:ok, sprite_name, working_dir} ->
-          Logger.info("Pre-warmed sprite for task #{task.id}")
-          GenServer.cast(allocator_pid, {:prewarm_complete, task.id, sprite_name, working_dir})
+    if already_prewarming or already_cached do
+      Logger.debug(
+        "Skipping prewarm for task #{task.id} (already #{if already_cached, do: "cached", else: "in progress"})"
+      )
 
-        {:error, reason} ->
-          Logger.warning("Failed to pre-warm sprite for task #{task.id}: #{inspect(reason)}")
-          GenServer.cast(allocator_pid, {:prewarm_failed, task.id})
-      end
-    end)
+      {:noreply, state}
+    else
+      # Mark as prewarming
+      state = Map.update!(state, :prewarming, &MapSet.put(&1, task.id))
+      allocator_pid = self()
 
-    {:noreply, state}
+      # Pre-warm in background, cache result when done
+      spawn(fn -> do_prewarm_task(task, allocator_pid) end)
+
+      {:noreply, state}
+    end
   end
 
   def handle_cast({:prewarm_complete, task_id, sprite_name, working_dir}, state) do
@@ -257,7 +267,37 @@ defmodule MiniMe.Sandbox.Allocator do
     end
   end
 
+  @impl true
+  def handle_info(:cleanup_stale_locks, state) do
+    cleanup_stale_locks()
+    schedule_cleanup()
+    {:noreply, state}
+  end
+
   # Private Functions
+
+  defp schedule_cleanup do
+    Process.send_after(self(), :cleanup_stale_locks, @cleanup_interval_ms)
+  end
+
+  defp cleanup_stale_locks do
+    import Ecto.Query
+
+    expiration_threshold =
+      DateTime.utc_now()
+      |> DateTime.add(-@lock_expiration_ms, :millisecond)
+
+    {count, _} =
+      MiniMe.Repos.Repo
+      |> where([r], not is_nil(r.locked_by_task_id) and r.locked_at < ^expiration_threshold)
+      |> MiniMe.Repo.update_all(set: [locked_by_task_id: nil, locked_at: nil])
+
+    if count > 0 do
+      Logger.info("Cleaned up #{count} stale repo lock(s)")
+    end
+
+    count
+  end
 
   defp check_and_acquire_lock(state, _task_id, nil) do
     # No repo, no lock needed
@@ -268,6 +308,10 @@ defmodule MiniMe.Sandbox.Allocator do
     # Use database transaction to atomically check and acquire lock
     import Ecto.Query
 
+    expiration_threshold =
+      DateTime.utc_now()
+      |> DateTime.add(-@lock_expiration_ms, :millisecond)
+
     result =
       MiniMe.Repo.transaction(fn ->
         repo =
@@ -276,37 +320,46 @@ defmodule MiniMe.Sandbox.Allocator do
           |> lock("FOR UPDATE")
           |> MiniMe.Repo.one()
 
-        case repo do
-          nil ->
-            {:error, :repo_not_found}
-
-          %{locked_by_task_id: nil} ->
-            # Lock is available, acquire it
-            repo
-            |> Ecto.Changeset.change(%{
-              locked_by_task_id: task_id,
-              locked_at: DateTime.utc_now()
-            })
-            |> MiniMe.Repo.update!()
-
-            :ok
-
-          %{locked_by_task_id: ^task_id} ->
-            # Already have the lock
-            :ok
-
-          %{locked_by_task_id: other_task_id} ->
-            # Locked by another task
-            {:error, :repo_locked, other_task_id}
-        end
+        handle_repo_lock(repo, task_id, repo_id, expiration_threshold)
       end)
 
-    case result do
-      {:ok, :ok} -> {:ok, state}
-      {:ok, {:error, :repo_locked, other_task_id}} -> {:error, :repo_locked, other_task_id}
-      {:ok, {:error, :repo_not_found}} -> {:error, :repo_not_found}
-      {:error, _} = error -> error
+    normalize_lock_result(result, state)
+  end
+
+  defp handle_repo_lock(nil, _task_id, _repo_id, _threshold), do: {:error, :repo_not_found}
+
+  defp handle_repo_lock(%{locked_by_task_id: nil} = repo, task_id, _repo_id, _threshold) do
+    acquire_lock(repo, task_id)
+  end
+
+  defp handle_repo_lock(%{locked_by_task_id: task_id}, task_id, _repo_id, _threshold), do: :ok
+
+  defp handle_repo_lock(%{locked_by_task_id: other_task_id, locked_at: locked_at} = repo, task_id, repo_id, threshold) do
+    if lock_expired?(locked_at, threshold) do
+      Logger.info("Taking over expired lock on repo #{repo_id} from task #{other_task_id}")
+      acquire_lock(repo, task_id)
+    else
+      {:error, :repo_locked, other_task_id}
     end
+  end
+
+  defp lock_expired?(nil, _threshold), do: false
+  defp lock_expired?(locked_at, threshold), do: DateTime.compare(locked_at, threshold) == :lt
+
+  defp normalize_lock_result({:ok, :ok}, state), do: {:ok, state}
+  defp normalize_lock_result({:ok, {:error, :repo_locked, other_task_id}}, _state), do: {:error, :repo_locked, other_task_id}
+  defp normalize_lock_result({:ok, {:error, :repo_not_found}}, _state), do: {:error, :repo_not_found}
+  defp normalize_lock_result({:error, _} = error, _state), do: error
+
+  defp acquire_lock(repo, task_id) do
+    repo
+    |> Ecto.Changeset.change(%{
+      locked_by_task_id: task_id,
+      locked_at: DateTime.utc_now()
+    })
+    |> MiniMe.Repo.update!()
+
+    :ok
   end
 
   defp release_lock(state, _task_id, nil), do: state
@@ -499,6 +552,18 @@ defmodule MiniMe.Sandbox.Allocator do
       {:error, reason} ->
         Logger.warning("Git pull error: #{inspect(reason)}")
         {:ok, working_dir}
+    end
+  end
+
+  defp do_prewarm_task(task, allocator_pid) do
+    case setup_sprite_for_task(task) do
+      {:ok, sprite_name, working_dir} ->
+        Logger.info("Pre-warmed sprite for task #{task.id}")
+        GenServer.cast(allocator_pid, {:prewarm_complete, task.id, sprite_name, working_dir})
+
+      {:error, reason} ->
+        Logger.warning("Failed to pre-warm sprite for task #{task.id}: #{inspect(reason)}")
+        GenServer.cast(allocator_pid, {:prewarm_failed, task.id})
     end
   end
 end

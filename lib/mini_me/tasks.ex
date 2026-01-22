@@ -30,6 +30,18 @@ defmodule MiniMe.Tasks do
   end
 
   @doc """
+  Get a task by ID with repo preloaded, returning nil if not found.
+  Also returns nil on database connection errors to allow graceful degradation.
+  """
+  def get_task_with_repo(id) do
+    Task
+    |> preload(:repo)
+    |> Repo.get(id)
+  rescue
+    DBConnection.ConnectionError -> nil
+  end
+
+  @doc """
   List all tasks, ordered by most recently updated.
   Optionally preload repo.
   """
