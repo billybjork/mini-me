@@ -2,6 +2,8 @@
 
 A multi-tenant AI assistant platform using Elixir/Phoenix for orchestration and [Fly.io Sprites](https://sprites.dev) for sandboxed execution environments.
 
+**Note:** This is a test PR to demonstrate the workflow.
+
 ## Direct Sprite Access (Debugging)
 
 Install the CLI:
